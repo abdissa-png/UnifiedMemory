@@ -48,63 +48,85 @@ class SemanticChunker(Chunker):
         embedding_model: str,
     ) -> List[Chunk]:
         """
-        Split document into semantic chunks.
+        Split document into semantic chunks across pages.
         """
-        chunks = []
-        chunk_idx = 0
-        
-        # Process page by page (or full text if preferred)
-        # Semantic mapping works best on continuous text, so let's try full text
-        # But we lose page mapping unless we track it carefully.
-        # For simplicity MVP: Chunk each page semantically.
+        # 1. Concatenate all pages into continuous text with offset tracking
+        full_text = ""
+        page_map: List[Tuple[int, int, int]] = []  # (start, end, page_number)
         
         for page in document.pages:
-            text = "\n".join(b["text"] for b in page.text_blocks)
-            if not text.strip():
+            # Use pre-computed full_text if available, else join blocks
+            page_text = page.full_text or "\n".join(b["text"] for b in page.text_blocks)
+            if not page_text.strip():
                 continue
+                
+            start_off = len(full_text)
+            full_text += page_text + "\n"
+            end_off = len(full_text)
             
-            page_chunks = await self._chunk_semantics(text)
+            if page.page_number is not None:
+                page_map.append((start_off, end_off, page.page_number))
+        
+        if not full_text:
+            return []
+
+        # 2. Perform semantic splitting on the full text
+        # Returns List of (text, start_index, end_index)
+        semantic_segments = await self._segment_semantics(full_text)
+        
+        chunks = []
+        for i, (text, start, end) in enumerate(semantic_segments):
+            # 3. Map segment back to source page
+            # We use the page where the chunk STARTS.
+            page_number = None
+            for p_start, p_end, p_num in page_map:
+                if p_start <= start < p_end:
+                    page_number = p_num
+                    break
             
-            for chunk_text in page_chunks:
-                chunk = self._create_chunk(
-                    text=chunk_text,
-                    document=document,
-                    chunk_index=chunk_idx,
-                    namespace=namespace,
-                    embedding_model=embedding_model,
-                    page_number=page.page_number
-                )
-                chunks.append(chunk)
-                chunk_idx += 1
+            chunk = self._create_chunk(
+                text=text,
+                document=document,
+                chunk_index=i,
+                namespace=namespace,
+                embedding_model=embedding_model,
+                page_number=page_number,
+                extra_metadata={
+                    "start_char": start,
+                    "end_char": end,
+                    "is_semantic": True
+                }
+            )
+            chunks.append(chunk)
                 
         return chunks
 
-    async def _chunk_semantics(self, text: str) -> List[str]:
+    async def _segment_semantics(self, text: str) -> List[Tuple[str, int, int]]:
         """
-        Split text based on semantic similarity.
+        Split text into semantic segments with offsets.
         """
-        # 1. Split into sentences
-        sentence_pattern = r'(?<=[.!?])\s+'
-        sentences = [s.strip() for s in re.split(sentence_pattern, text) if s.strip()]
+        # 1. Split into sentences and track offsets
+        # Use regex to find sentences and their positions
+        sentence_pattern = r'[^.!?]+[.!?]+(?:\s+|$)'
+        matches = list(re.finditer(sentence_pattern, text))
         
-        if not sentences:
-            return []
+        if not matches:
+            # Fallback for text without punctuation
+            return [(text, 0, len(text))]
         
-        if len(sentences) == 1:
-            return sentences
+        sentences = [m.group(0).strip() for m in matches]
+        offsets = [(m.start(), m.end()) for m in matches]
             
         # 2. Embed sentences
         embeddings = await self.embedding_provider.embed_batch(
             sentences, Modality.TEXT
         )
         
-        # 3. Calculate cosine distances between consecutive sentences
+        # 3. Calculate distances
         distances = []
         for i in range(len(embeddings) - 1):
             emb1 = np.array(embeddings[i])
             emb2 = np.array(embeddings[i+1])
-            
-            # Normalize
             norm1 = np.linalg.norm(emb1)
             norm2 = np.linalg.norm(emb2)
             
@@ -112,31 +134,35 @@ class SemanticChunker(Chunker):
                 similarity = 0.0
             else:
                 similarity = np.dot(emb1, emb2) / (norm1 * norm2)
-            
-            distance = 1 - similarity
-            distances.append(distance)
+            distances.append(1 - similarity)
         
         # 4. Determine split points
-        # Split where distance > threshold (dissimilar)
-        # Or use percentile based threshold for dynamic splitting
+        config_threshold = 1 - self.similarity_threshold
         
-        # Simple thresholding
-        config_threshold = 1 - self.similarity_threshold  # Convert sim to dist
-        
-        chunks = []
-        current_chunk = [sentences[0]]
+        segments = []
+        current_sentences = [sentences[0]]
+        current_start = offsets[0][0]
         
         for i, distance in enumerate(distances):
-            # distances[i] is between sentence[i] and sentence[i+1]
             if distance > config_threshold:
-                # Split here
-                chunks.append(" ".join(current_chunk))
-                current_chunk = [sentences[i+1]]
+                # Split
+                segments.append((
+                    " ".join(current_sentences),
+                    current_start,
+                    offsets[i][1]
+                ))
+                current_sentences = [sentences[i+1]]
+                current_start = offsets[i+1][0]
             else:
-                # Keep together
-                current_chunk.append(sentences[i+1])
+                # Merge
+                current_sentences.append(sentences[i+1])
         
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
+        # Flush remaining
+        if current_sentences:
+            segments.append((
+                " ".join(current_sentences),
+                current_start,
+                offsets[-1][1]
+            ))
             
-        return chunks
+        return segments

@@ -107,13 +107,14 @@ class MemoryVectorStore(VectorStoreBackend):
         self,
         id: str,
         collection: Optional[str] = None,
+        namespace: str = "default",
     ) -> Optional[VectorSearchResult]:
         """Get vector by ID."""
         # Note: In real systems, we might search across collections if not specified,
         # but here we require strict collection targeting or default to namespace behavior
         # For simplicity in this mock, we search all if collection is None (inefficient)
         
-        target_collections = [collection] if collection else list(self._collections.keys())
+        target_collections = [collection] if collection else [namespace] if namespace != "default" and namespace in self._collections else list(self._collections.keys())
         
         async with self._lock:
             for col_name in target_collections:

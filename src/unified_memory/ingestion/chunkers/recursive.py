@@ -52,7 +52,7 @@ class RecursiveChunker(Chunker):
         # Let's chunk per page for now as it's safer for provenance.
         
         for page in document.pages:
-            text = "\n".join(b["text"] for b in page.text_blocks)
+            text = page.full_text or "\n".join(b["text"] for b in page.text_blocks)
             
             if not text.strip():
                 continue
@@ -95,9 +95,10 @@ class RecursiveChunker(Chunker):
         
         # 1. Base case: no separators left
         if not separators:
-            # If no separators left, we must hard split (character based) if still too large?
-            # Or just return as is?
-            # Let's just return as is for now, or character split.
+            # If no separators left and text is still too large, 
+            # perform character-based splitting without overlap for safety.
+            if len(text) > chunk_size:
+                return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
             return [text]
             
         separator = separators[0]

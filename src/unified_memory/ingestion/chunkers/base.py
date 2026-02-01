@@ -42,6 +42,15 @@ class ChunkingConfig:
     min_chunk_size: int = 100
     max_chunk_size: int = 2048
 
+    def __post_init__(self) -> None:
+        """Validate configuration."""
+        if self.chunk_overlap >= self.chunk_size:
+            # P1 fix #17 - Prevent infinite loops in chunkers
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be smaller than "
+                f"chunk_size ({self.chunk_size})."
+            )
+
 
 class Chunker(ABC):
     """

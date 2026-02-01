@@ -10,7 +10,7 @@ import fnmatch
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
-from unified_memory.storage.base import KVStoreBackend
+from unified_memory.storage.base import KVStoreBackend, VersionedValue
 
 
 class MemoryKVStore(KVStoreBackend):
@@ -25,13 +25,15 @@ class MemoryKVStore(KVStoreBackend):
         self._store: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
 
-    async def get(self, key: str) -> Optional[Dict[str, Any]]:
+    async def get(self, key: str) -> Optional[VersionedValue]:
         """Get value by key."""
         async with self._lock:
-            # Return a copy to prevent mutation of stored objects
-            value = self._store.get(key)
-            if value:
-                return value.copy()
+            entry = self._store.get(key)
+            if entry:
+                return VersionedValue(
+                    data=entry["data"].copy(),
+                    version=entry["version"]
+                )
             return None
 
     async def set(
@@ -40,10 +42,14 @@ class MemoryKVStore(KVStoreBackend):
         value: Dict[str, Any],
         ttl_seconds: Optional[int] = None,
     ) -> bool:
-        """Set value."""
+        """Set value and increment version."""
         async with self._lock:
-            # Store a copy
-            self._store[key] = value.copy()
+            current = self._store.get(key, {"version": 0})
+            new_version = current["version"] + 1
+            self._store[key] = {
+                "data": value.copy(),
+                "version": new_version
+            }
             return True
 
     async def delete(self, key: str) -> bool:
@@ -60,11 +66,14 @@ class MemoryKVStore(KVStoreBackend):
         value: Dict[str, Any],
         ttl_seconds: Optional[int] = None,
     ) -> bool:
-        """Atomic set if not exists."""
+        """Atomic set if not exists. Initializes version to 1."""
         async with self._lock:
             if key in self._store:
                 return False
-            self._store[key] = value.copy()
+            self._store[key] = {
+                "data": value.copy(),
+                "version": 1
+            }
             return True
 
     async def compare_and_swap(
@@ -73,17 +82,19 @@ class MemoryKVStore(KVStoreBackend):
         expected_version: int,
         new_value: Dict[str, Any],
     ) -> bool:
-        """Atomic compare and swap."""
+        """Atomic compare and swap. Increments version on success."""
         async with self._lock:
             current = self._store.get(key)
             if not current:
                 return False
             
-            # Check version
-            if current.get("version") != expected_version:
+            if current["version"] != expected_version:
                 return False
             
-            self._store[key] = new_value.copy()
+            self._store[key] = {
+                "data": new_value.copy(),
+                "version": current["version"] + 1
+            }
             return True
 
     async def delete_if_version(
@@ -97,7 +108,7 @@ class MemoryKVStore(KVStoreBackend):
             if not current:
                 return False
             
-            if current.get("version") != expected_version:
+            if current["version"] != expected_version:
                 return False
             
             del self._store[key]
@@ -119,6 +130,10 @@ class MemoryKVStore(KVStoreBackend):
             matches = fnmatch.filter(self._store.keys(), pattern)
             count = 0
             for key in matches:
+                data = self._store.get(key)
+                if data:
+                    # We store data/version dict internally
+                    pass
                 del self._store[key]
                 count += 1
             return count

@@ -35,9 +35,11 @@ class TenantManager:
         
     async def get_tenant_config(self, tenant_id: str) -> Optional[TenantConfig]:
         """Retrieve tenant configuration."""
-        data = await self.kv_store.get(self._key(tenant_id))
-        if not data:
+        versioned = await self.kv_store.get(self._key(tenant_id))
+        if not versioned:
             return None
+            
+        data = versioned.data
             
         # Handle nested dataclasses
         if "text_embedding" in data and isinstance(data["text_embedding"], dict):

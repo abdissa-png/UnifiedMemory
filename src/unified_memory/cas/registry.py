@@ -90,10 +90,10 @@ class CASRegistry:
     
     async def get_entry(self, content_hash: str) -> Optional[CASEntry]:
         """Lookup CAS entry by hash."""
-        data = await self._store.get(self._key(content_hash))
-        if not data:
+        versioned = await self._store.get(self._key(content_hash))
+        if not versioned:
             return None
-        return CASEntry.from_dict(data)
+        return CASEntry.from_dict(versioned.data)
     
     async def register(
         self,
@@ -132,20 +132,19 @@ class CASRegistry:
         chunk_index: int,
     ) -> bool:
         """
-        Add a usage reference to a CAS entry.
-        
-        Uses optimistic locking (compare-and-swap) to update the list safely.
+        Add a usage reference to a CAS entry with optimistic locking.
         """
+        import asyncio
         key = self._key(content_hash)
         
         # Retry loop for CAS (Compare-And-Swap)
-        for _ in range(5):  # Max 5 retries
-            data = await self._store.get(key)
-            if not data:
-                return False  # Content not found (race condition?)
+        for attempt in range(5):  # Max 5 retries
+            versioned = await self._store.get(key)
+            if not versioned:
+                return False  # Content not found
             
             # Reconstruct object
-            entry = CASEntry.from_dict(data)
+            entry = CASEntry.from_dict(versioned.data)
             
             # Create new reference
             new_ref = CASReference(namespace, document_id, chunk_index)
@@ -159,30 +158,18 @@ class CASRegistry:
             # Add ref
             entry.refs.append(new_ref)
             
-            # Attempt CAS update
-            # Note: We need the store to return version/support versioning
-            # Our current abstract KVStoreBackend defined compare_and_swap.
-            # But the 'data' returned from get() needs to include version info 
-            # or we need to manage versioning.
-            # Assuming for now 'get' returns raw dict, but we need version.
-            # Let's check KVStoreBackend signature.
+            # Attempt CAS update using the version we got
+            success = await self._store.compare_and_swap(
+                key, 
+                versioned.version, 
+                entry.to_dict()
+            )
             
-            # KVStoreBackend.compare_and_swap(key, expected_version, new_value)
-            # MemoryKVStore implements simple integer versioning.
-            # But get() in MemoryKVStore just returns data['value'].
-            # Wait, `MemoryKVStore.get` implementation:
-            # return self._store[key]["value"]
-            # It hides the version!
-            
-            # FIX: We need access to version. 
-            # But for now, let's assume we can rely on a simpler read-modify-write 
-            # if we accept last-writer-wins or if the KV store handles locking.
-            # Unsafe in distributed sys, but OK for MVP with MemoryStore.
-            # Proper fix: Use optimistic locking if KV store exposes version.
-            
-            # Let's try simple set first.
-            await self._store.set(key, entry.to_dict())
-            return True
+            if success:
+                return True
+                
+            # Version mismatch - retry with backoff
+            await asyncio.sleep(0.01 * (attempt + 1))
             
         return False
 
@@ -195,11 +182,11 @@ class CASRegistry:
     ) -> bool:
         """Remove a reference."""
         key = self._key(content_hash)
-        data = await self._store.get(key)
-        if not data:
+        versioned = await self._store.get(key)
+        if not versioned:
             return False
             
-        entry = CASEntry.from_dict(data)
+        entry = CASEntry.from_dict(versioned.data)
         
         # Filter out the reference
         original_len = len(entry.refs)
@@ -234,8 +221,8 @@ class CASRegistry:
         keys = await self._store.scan("cas:*")
         orphans = []
         for key in keys:
-            data = await self._store.get(key)
-            if data and not data.get("refs"):
+            versioned = await self._store.get(key)
+            if versioned and not versioned.data.get("refs"):
                 # Extract hash from key "cas:..."
                 orphans.append(key.split(":", 1)[1])
         return orphans

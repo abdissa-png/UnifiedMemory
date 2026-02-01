@@ -10,9 +10,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, AsyncIterator, Protocol, runtime_checkable, Tuple
+from typing import Any, Dict, List, Optional, AsyncIterator, Protocol, runtime_checkable, Tuple, Union
+from dataclasses import dataclass, field
 
 from unified_memory.core.types import VectorSearchResult, GraphNode, GraphEdge
+
+
+@dataclass
+class VersionedValue:
+    """Value with version for optimistic locking."""
+    data: Dict[str, Any]
+    version: int
 
 
 class KVStoreBackend(ABC):
@@ -24,9 +32,12 @@ class KVStoreBackend(ABC):
     """
 
     @abstractmethod
-    async def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """Get value by key. Returns None if not found."""
-
+    async def get(self, key: str) -> Optional[VersionedValue]:
+        """
+        Get value by key. Returns None if not found.
+        
+        Returns VersionedValue containing the data and version number.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -208,6 +219,7 @@ class VectorStoreBackend(ABC):
         self,
         id: str,
         collection: Optional[str] = None,
+        namespace: str = "default",
     ) -> Optional[VectorSearchResult]:
         """Get vector by ID."""
 

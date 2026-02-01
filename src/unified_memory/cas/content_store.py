@@ -34,10 +34,10 @@ class ContentStore:
     
     async def get_content(self, content_id: str) -> Optional[str]:
         """Retrieve content payload."""
-        data = await self._store.get(self._key(content_id))
-        if not data:
+        versioned = await self._store.get(self._key(content_id))
+        if not versioned:
             return None
-        return data.get("payload")
+        return versioned.data.get("payload")
     
     async def store_content(
         self,

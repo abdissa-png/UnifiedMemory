@@ -66,11 +66,11 @@ class NamespaceManager:
         if namespace in cache:
             return cache[namespace]
 
-        data = await self.kv_store.get(f"ns_config:{namespace}")
-        if not data:
+        versioned = await self.kv_store.get(f"ns_config:{namespace}")
+        if not versioned:
             return None
 
-        config = NamespaceConfig(**data)
+        config = NamespaceConfig(**versioned.data)
         cache[namespace] = config
         return config
 
@@ -162,8 +162,8 @@ class NamespaceManager:
           tenant_config:{tenant_id} -> TenantConfig dict
         """
 
-        data = await self.kv_store.get(f"tenant_config:{tenant_id}")
-        if not data:
+        versioned = await self.kv_store.get(f"tenant_config:{tenant_id}")
+        if not versioned:
             # Derive default tenant config if missing
             cfg = TenantConfig(
                 tenant_id=tenant_id,
@@ -172,6 +172,7 @@ class NamespaceManager:
             await self.kv_store.set(f"tenant_config:{tenant_id}", asdict(cfg))
             return cfg
 
+        data = versioned.data
         cfg = TenantConfig(**data)
         if not cfg.updated_at:
             cfg.updated_at = cfg.created_at
@@ -214,22 +215,22 @@ class NamespaceManager:
 
         # 1. Own namespaces
         user_ns_key = f"idx:user_namespaces:{tenant_id}:{user_id}"
-        own_ns = await self.kv_store.get(user_ns_key)
-        if own_ns and "namespaces" in own_ns:
-            namespaces.extend(own_ns["namespaces"])
+        versioned_own = await self.kv_store.get(user_ns_key)
+        if versioned_own and "namespaces" in versioned_own.data:
+            namespaces.extend(versioned_own.data["namespaces"])
 
         # 2. Shared namespaces via ACL
         acl_key = f"idx:acl_access:{tenant_id}:{user_id}"
-        shared_ns = await self.kv_store.get(acl_key)
-        if shared_ns and "namespaces" in shared_ns:
-            namespaces.extend(shared_ns["namespaces"])
+        versioned_shared = await self.kv_store.get(acl_key)
+        if versioned_shared and "namespaces" in versioned_shared.data:
+            namespaces.extend(versioned_shared.data["namespaces"])
 
         # 3. Public namespaces
         if include_public:
             public_key = f"idx:public_namespaces:{tenant_id}"
-            public_ns = await self.kv_store.get(public_key)
-            if public_ns and "namespaces" in public_ns:
-                namespaces.extend(public_ns["namespaces"])
+            versioned_public = await self.kv_store.get(public_key)
+            if versioned_public and "namespaces" in versioned_public.data:
+                namespaces.extend(versioned_public.data["namespaces"])
 
         # De-duplicate
         return list(set(namespaces))
@@ -248,7 +249,8 @@ class NamespaceManager:
         """
 
         key = f"idx:user_namespaces:{tenant_id}:{user_id}"
-        data = await self.kv_store.get(key) or {"namespaces": []}
+        versioned = await self.kv_store.get(key)
+        data = versioned.data if versioned else {"namespaces": []}
         ns_set = set(data.get("namespaces", []))
         if add:
             ns_set.add(namespace_id)
@@ -271,7 +273,8 @@ class NamespaceManager:
         """
 
         key = f"idx:public_namespaces:{tenant_id}"
-        data = await self.kv_store.get(key) or {"namespaces": []}
+        versioned = await self.kv_store.get(key)
+        data = versioned.data if versioned else {"namespaces": []}
         ns_set = set(data.get("namespaces", []))
         if add:
             ns_set.add(namespace_id)

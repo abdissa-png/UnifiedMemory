@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
-from unified_memory.core.types import Chunk, SourceReference, SourceType, Modality
+from unified_memory.core.types import Chunk, SourceReference, SourceType, Modality, CollectionType, compute_content_hash
 from unified_memory.ingestion.parsers.base import DocumentParser, ParsedDocument
 from unified_memory.ingestion.chunkers.base import Chunker
 from unified_memory.embeddings.base import EmbeddingProvider
@@ -21,6 +21,7 @@ from unified_memory.storage.base import VectorStoreBackend, GraphStoreBackend
 from unified_memory.cas.registry import CASRegistry
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.ingestion.extractors.base import Extractor
+from unified_memory.namespace.manager import NamespaceManager
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +69,7 @@ class IngestionPipeline:
         vector_store: VectorStoreBackend,
         cas_registry: CASRegistry,
         content_store: ContentStore,
+        namespace_manager: NamespaceManager,
         graph_store: Optional[GraphStoreBackend] = None,
         chunker: Optional[Chunker] = None,
         parser_registry: Optional[ParserRegistry] = None,
@@ -79,6 +81,7 @@ class IngestionPipeline:
         self.vector_store = vector_store
         self.cas_registry = cas_registry
         self.content_store = content_store
+        self.namespace_manager = namespace_manager
         self.graph_store = graph_store
         self.extractors: List[Extractor] = []
         
@@ -115,7 +118,10 @@ class IngestionPipeline:
             logger.exception("Embedding failed")
             return [f"Embedding error: {str(e)}"]
 
-        # 1.5 Structural Graph Storage (Page Nodes)
+        # 1.5 Structural Graph Storage (Page Nodes) - Batching Preparation
+        nodes_to_create: List[Any] = []
+        edges_to_create: List[Any] = []
+        
         if self.graph_store and parsed_document:
             from unified_memory.core.types import PageNode, NodeType
             for page in parsed_document.pages:
@@ -127,16 +133,17 @@ class IngestionPipeline:
                     document_id=parsed_document.document_id,
                     node_type=NodeType.PAGE
                 )
-                try:
-                    await self.graph_store.create_node(page_node, namespace)
-                except Exception as e:
-                    logger.warning(f"Failed to create page node: {e}")
+                nodes_to_create.append(page_node)
 
-        # 2. Storage with Saga-like cleanup (partial implementation for now)
-        # In a real Saga, we'd track exactly what was created to roll back.
-        # Here we prioritize atomicity per chunk.
-        
+        # 2. Sequential processing for CAS/Content (requires ordering/locking)
         errors = []
+        processed_chunks: List[Chunk] = []
+        
+        # Resolve collection name (P0 fix #15)
+        text_collection = await self.namespace_manager.get_collection_name(
+            namespace, CollectionType.TEXTS
+        )
+        
         for i, chunk in enumerate(chunks):
             try:
                 # Content ID is often same as content hash in CAS
@@ -159,23 +166,22 @@ class IngestionPipeline:
                 # Content Storage (deduplicated)
                 await self.content_store.store_content(content_id, chunk.content)
                 
-            # Vector Storage
+                # Vector Storage (P0 fix #4 - remove content duplication, #15 - use collection)
                 vector_data = {
                     "id": f"{chunk.document_id}:{chunk.chunk_index}",
                     "embedding": chunk.embedding,
                     "metadata": {
                         **chunk.metadata,
-                        "content": chunk.content, # duplicate for convenience in search
                         "content_hash": chunk.content_hash,
+                        # "content": chunk.content,  <-- REMOVED per P0 fix #4
                     }
                 }
-                await self.vector_store.upsert([vector_data], namespace)
+                await self.vector_store.upsert([vector_data], namespace, collection=text_collection)
                 
-                # 3. Extraction and Graph Storage
+                # 3. Extraction and Graph Storage Preparation (P0 fix #3 - batching)
                 if self.graph_store:
                     from unified_memory.core.types import EntityNode, GraphEdge, NodeType, PassageNode
                     
-                    # Store PassageNode (the chunk itself in the graph)
                     passage_node = PassageNode(
                         id=f"chunk:{chunk.document_id}:{chunk.chunk_index}",
                         content=chunk.content,
@@ -183,26 +189,23 @@ class IngestionPipeline:
                         node_type=NodeType.PASSAGE,
                         properties={**chunk.metadata, "content_hash": chunk.content_hash}
                     )
-                    await self.graph_store.create_node(passage_node, namespace)
+                    nodes_to_create.append(passage_node)
                     
-                    # Link to Page node if available
                     if chunk.page_number is not None:
-                        link_edge = GraphEdge(
+                        edges_to_create.append(GraphEdge(
                             source_id=f"page:{chunk.document_id}:{chunk.page_number}",
                             target_id=passage_node.id,
                             relation="HAS_CHUNK",
                             namespace=namespace
-                        )
-                        await self.graph_store.create_edge(link_edge, namespace)
+                        ))
 
                     if self.extractors:
                         for extractor in self.extractors:
                             extraction = await extractor.extract(chunk)
                             
-                            # Store entities
                             for ent in extraction.entities:
                                 node = EntityNode(
-                                    id=ent.name,
+                                    id=ent.name, # Should ideally be normalized
                                     content=ent.description or "",
                                     namespace=namespace,
                                     entity_name=ent.name,
@@ -210,33 +213,81 @@ class IngestionPipeline:
                                     properties=ent.properties,
                                     node_type=NodeType.ENTITY
                                 )
-                                await self.graph_store.create_node(node, namespace)
-                                
-                                # Link chunk to entity
-                                ent_edge = GraphEdge(
+                                nodes_to_create.append(node)
+                                edges_to_create.append(GraphEdge(
                                     source_id=passage_node.id,
                                     target_id=node.id,
                                     relation="MENTIONS",
                                     namespace=namespace
-                                )
-                                await self.graph_store.create_edge(ent_edge, namespace)
+                                ))
                                 
-                            # Store relations
                             for rel in extraction.relations:
-                                edge = GraphEdge(
+                                edges_to_create.append(GraphEdge(
                                     source_id=rel.source_entity,
                                     target_id=rel.target_entity,
                                     relation=rel.relation_type,
                                     properties=rel.properties,
                                     namespace=namespace
-                                )
-                                await self.graph_store.create_edge(edge, namespace)
+                                ))
                 
+                processed_chunks.append(chunk)
+
             except Exception as e:
                 logger.exception(f"Failed to process chunk {i}")
                 errors.append(f"Chunk {i} processing error: {str(e)}")
-                # TODO: Implement rollback logic for standard Saga pattern (P1 issue #5)
-        
+
+        # 4. Batch Operations for Graph (P0 fix #3)
+        if self.graph_store and nodes_to_create:
+            try:
+                await self.graph_store.create_nodes_batch(nodes_to_create, namespace)
+                if edges_to_create:
+                    await self.graph_store.create_edges_batch(edges_to_create, namespace)
+            except Exception as e:
+                logger.error(f"Batch graph creation failed: {e}")
+                errors.append(f"Graph batch error: {str(e)}")
+
+        # 5. Entity/Relation Embeddings (P0 fix #2)
+        if self.vector_store and nodes_to_create:
+            entity_nodes = [node for node in nodes_to_create if hasattr(node, "node_type") and node.node_type == NodeType.ENTITY]
+            if entity_nodes:
+                entity_collection = await self.namespace_manager.get_collection_name(
+                    namespace, CollectionType.ENTITIES
+                )
+                
+                # Extract unique entities by content to avoid redundant embedding
+                unique_entities: Dict[str, EntityNode] = {}
+                for ent in entity_nodes:
+                    if ent.id not in unique_entities:
+                        unique_entities[ent.id] = ent
+                
+                if unique_entities:
+                    ent_list = list(unique_entities.values())
+                    # Use a descriptive text for embedding: "Name: Description"
+                    ent_contents = [f"{e.entity_name}: {e.content}" if e.content else e.entity_name for e in ent_list]
+                    try:
+                        ent_embeddings = await self.embedding_provider.embed_batch(
+                            ent_contents, modality=Modality.TEXT
+                        )
+                        
+                        ent_vector_data = []
+                        for ent, emb in zip(ent_list, ent_embeddings):
+                            ent_vector_data.append({
+                                "id": ent.id,
+                                "embedding": emb,
+                                "metadata": {
+                                    "entity_name": ent.entity_name,
+                                    "entity_type": ent.entity_type,
+                                    "content_hash": compute_content_hash(ent.content or ent.entity_name, embedding_model)
+                                }
+                            })
+                        
+                        await self.vector_store.upsert(
+                            ent_vector_data, namespace, collection=entity_collection
+                        )
+                    except Exception as e:
+                        logger.error(f"Entity embedding/storage failed: {e}")
+                        errors.append(f"Entity semantic index error: {str(e)}")
+
         return errors
 
     async def ingest_file(
@@ -254,9 +305,19 @@ class IngestionPipeline:
             return IngestionResult(doc_id, source_ref, errors=[f"No parser for {path.suffix}"])
         
         try:
-            parsed = await parser.parse_file(path, doc_id, **options)
+            # P1 fix #5 - Validate embedding model against tenant config
+            ns_config = await self.namespace_manager.get_config(namespace)
+            if not ns_config:
+                return IngestionResult(doc_id, source_ref, errors=[f"Namespace {namespace} not found"])
             
-            embedding_model = options.get("embedding_model", self.embedding_provider.model_id)
+            tenant_config = await self.namespace_manager.get_tenant_config(ns_config.tenant_id)
+            embedding_model = options.get("embedding_model", tenant_config.text_embedding.model)
+            
+            if embedding_model != tenant_config.text_embedding.model:
+                 # In a strict system, we might reject this. For now, log warning.
+                 logger.warning(f"Requested model {embedding_model} differs from tenant default {tenant_config.text_embedding.model}")
+
+            parsed = await parser.parse_file(path, doc_id, **options)
             chunks = await self.chunker.chunk(parsed, namespace, embedding_model=embedding_model)
             
             processing_errors = await self._process_chunks(
@@ -299,7 +360,14 @@ class IngestionPipeline:
         )
         
         try:
-            embedding_model = self.embedding_provider.model_id
+            # P1 fix #5 - Validate embedding model
+            ns_config = await self.namespace_manager.get_config(namespace)
+            if not ns_config:
+                 return IngestionResult(doc_id, source_ref, errors=[f"Namespace {namespace} not found"])
+            
+            tenant_config = await self.namespace_manager.get_tenant_config(ns_config.tenant_id)
+            embedding_model = tenant_config.text_embedding.model
+            
             chunks = await self.chunker.chunk(parsed, namespace, embedding_model=embedding_model)
             
             processing_errors = await self._process_chunks(

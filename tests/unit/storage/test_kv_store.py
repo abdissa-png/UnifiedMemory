@@ -13,12 +13,14 @@ async def test_basic_crud(kv_store):
     
     # Get
     val = await kv_store.get("key1")
-    assert val == {"value": "test"}
+    assert val.data == {"value": "test"}
+    assert val.version == 1
     
     # Update
     await kv_store.set("key1", {"value": "updated"})
     val = await kv_store.get("key1")
-    assert val == {"value": "updated"}
+    assert val.data == {"value": "updated"}
+    assert val.version == 2
     
     # Delete
     deleted = await kv_store.delete("key1")
@@ -36,13 +38,13 @@ async def test_set_if_not_exists(kv_store):
     success = await kv_store.set_if_not_exists("key1", {"value": "1"})
     assert success is True
     val = await kv_store.get("key1")
-    assert val == {"value": "1"}
+    assert val.data == {"value": "1"}
     
     # Failure (already exists)
     success = await kv_store.set_if_not_exists("key1", {"value": "2"})
     assert success is False
     val = await kv_store.get("key1")
-    assert val == {"value": "1"}
+    assert val.data == {"value": "1"}
 
 @pytest.mark.asyncio
 async def test_compare_and_swap(kv_store):
@@ -56,7 +58,7 @@ async def test_compare_and_swap(kv_store):
     )
     assert success is True
     val = await kv_store.get("key1")
-    assert val == {"value": "2", "version": 2}
+    assert val.data == {"value": "2", "version": 2}
     
     # Failure (version mismatch)
     success = await kv_store.compare_and_swap(
@@ -66,7 +68,7 @@ async def test_compare_and_swap(kv_store):
     )
     assert success is False
     val = await kv_store.get("key1")
-    assert val == {"value": "2", "version": 2}
+    assert val.data == {"value": "2", "version": 2}
     
     # Failure (key not found)
     success = await kv_store.compare_and_swap(

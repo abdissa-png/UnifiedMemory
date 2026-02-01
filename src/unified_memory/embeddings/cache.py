@@ -110,10 +110,10 @@ class CachedEmbeddingProvider(EmbeddingProvider):
         
         # Check KV store if available
         if self._kv_store:
-            cached = await self._kv_store.get(f"emb_cache:{cache_key}")
-            if cached and "embedding" in cached:
+            versioned = await self._kv_store.get(f"emb_cache:{cache_key}")
+            if versioned and "embedding" in versioned.data:
                 self._hits += 1
-                embedding = cached["embedding"]
+                embedding = versioned.data["embedding"]
                 self._cache[cache_key] = embedding  # Populate local cache
                 return embedding
         
@@ -159,15 +159,28 @@ class CachedEmbeddingProvider(EmbeddingProvider):
         for i, content in enumerate(contents):
             cache_key = self._compute_cache_key(content, modality)
             
+            # 1. Check in-memory cache
             if cache_key in self._cache:
                 self._hits += 1
                 results[i] = self._cache[cache_key]
-            else:
-                self._misses += 1
-                if cache_key not in pending_misses:
-                    pending_misses[cache_key] = []
-                    failed_key_content_map[cache_key] = content
-                pending_misses[cache_key].append(i)
+                continue
+            
+            # 2. Check KV store (P1 fix #16)
+            if self._kv_store:
+                versioned = await self._kv_store.get(f"emb_cache:{cache_key}")
+                if versioned and "embedding" in versioned.data:
+                    self._hits += 1
+                    embedding = versioned.data["embedding"]
+                    self._cache[cache_key] = embedding  # Populate local cache
+                    results[i] = embedding
+                    continue
+            
+            # 3. Cache miss
+            self._misses += 1
+            if cache_key not in pending_misses:
+                pending_misses[cache_key] = []
+                failed_key_content_map[cache_key] = content
+            pending_misses[cache_key].append(i)
         
         # If we have unique misses, process them
         if pending_misses:
