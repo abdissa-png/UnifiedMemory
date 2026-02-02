@@ -46,14 +46,14 @@ class ContentStore:
     ) -> bool:
         """
         Store content payload.
-        Returns True if stored (or already existed).
+        
+        Returns:
+            True if content was newly stored.
+            False if content already existed (idempotent no-op).
         """
         key = self._key(content_id)
         
-        # Check existence first? Or just overwrite (idempotent)?
-        # For simplicity and CAS correctness, simple set is fine.
-        # But set_if_not_exists is safer to avoid unnecessary writes.
-        
+        # Use set_if_not_exists to avoid unnecessary writes and preserve original timestamp
         return await self._store.set_if_not_exists(key, {"payload": payload})
     
     async def delete_content(self, content_id: str) -> bool:
