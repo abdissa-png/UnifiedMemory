@@ -17,6 +17,33 @@ from .types import (
 )
 
 
+
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    """
+    Protocol for embedding providers.
+    """
+    
+    @property
+    def dimension(self) -> int:
+        """Embedding dimension."""
+        ...
+        
+    async def embed(
+        self,
+        text: str,
+    ) -> List[float]:
+        """Embed a single string."""
+        ...
+        
+    async def embed_batch(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+        """Embed a batch of strings."""
+        ...
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """

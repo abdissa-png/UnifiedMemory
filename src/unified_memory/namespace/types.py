@@ -8,7 +8,7 @@ UNIFIED_MEMORY_SYSTEM_DESIGN.md and INITIAL_PLAN.md.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import hashlib
 
 from unified_memory.core.types import NamespaceACL, Modality
@@ -221,3 +221,55 @@ class NamespaceConfig:
 
         return {"namespace": self.namespace_id}
 
+
+@dataclass
+class RetrievalConfig:
+    """
+    Resolved retrieval configuration.
+    
+    Determines how retrieval operations are executed:
+    - Which paths to use (dense, sparse, graph)
+    - How to fuse results
+    - Whether to rerank
+    """
+
+    embedding_model: str
+    fusion_method: str = "rrf"
+    rerank: bool = False
+    top_k: int = 10
+    paths: List[str] = field(default_factory=lambda: ["dense", "sparse", "graph"])
+    score_threshold: Optional[float] = None
+    
+    @classmethod
+    async def resolve(
+        cls,
+        namespace: str,
+        namespace_manager: Any,  # Typed as Any to avoid circular import with NamespaceManager
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> "RetrievalConfig":
+        """
+        Resolve config hierarchically:
+        1. Request options (highest priority)
+        2. Tenant defaults (from NamespaceConfig -> TenantConfig)
+        3. System defaults (fallback)
+        """
+        # Get namespace config to find tenant
+        ns_config = await namespace_manager.get_config(namespace)
+        if not ns_config:
+             # Fallback if namespace doesn't exist (shouldn't happen in valid flow)
+            return cls(embedding_model="text-embedding-3-small")
+
+        # Get tenant config for defaults
+        tenant_config = await namespace_manager.get_tenant_config(ns_config.tenant_id)
+        
+        request = request_options or {}
+        
+        return cls(
+            embedding_model=request.get("embedding_model") 
+                or tenant_config.text_embedding.model,
+            fusion_method=request.get("fusion_method", "rrf"),
+            rerank=request.get("rerank", False),
+            top_k=request.get("top_k", 10),
+            paths=request.get("paths", ["dense", "sparse", "graph"]),
+            score_threshold=request.get("score_threshold"),
+        )

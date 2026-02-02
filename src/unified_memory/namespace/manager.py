@@ -28,6 +28,9 @@ from unified_memory.namespace.validation import validate_namespace_id
 _request_namespace_cache: ContextVar[Dict[str, NamespaceConfig]] = ContextVar(
     "namespace_config_cache"
 )
+_request_tenant_cache: ContextVar[Dict[str, TenantConfig]] = ContextVar(
+    "tenant_config_cache"
+)
 
 
 class NamespaceManager:
@@ -162,6 +165,16 @@ class NamespaceManager:
           tenant_config:{tenant_id} -> TenantConfig dict
         """
 
+
+        try:
+            cache = _request_tenant_cache.get()
+        except LookupError:
+            cache = {}
+            _request_tenant_cache.set(cache)
+
+        if tenant_id in cache:
+            return cache[tenant_id]
+
         versioned = await self.kv_store.get(f"tenant_config:{tenant_id}")
         if not versioned:
             # Derive default tenant config if missing
@@ -170,12 +183,24 @@ class NamespaceManager:
                 updated_at=utc_now().isoformat(),
             )
             await self.kv_store.set(f"tenant_config:{tenant_id}", asdict(cfg))
+            cache[tenant_id] = cfg
             return cfg
 
         data = versioned.data
+        # Handle nested dataclasses - ensure we convert dicts to objects
+        if "text_embedding" in data:
+            if isinstance(data["text_embedding"], dict):
+                data["text_embedding"] = EmbeddingModelConfig(**data["text_embedding"])
+            # If it's already an EmbeddingModelConfig, leave it as is
+        
+        if "vision_embedding" in data and data["vision_embedding"] is not None:
+            if isinstance(data["vision_embedding"], dict):
+                data["vision_embedding"] = EmbeddingModelConfig(**data["vision_embedding"])
         cfg = TenantConfig(**data)
         if not cfg.updated_at:
             cfg.updated_at = cfg.created_at
+        
+        cache[tenant_id] = cfg
         return cfg
 
     async def get_collection_name(
