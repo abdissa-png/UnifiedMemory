@@ -26,22 +26,60 @@ import hashlib
 # ============================================================================
 
 
-def compute_content_hash(content: str, embedding_model: str) -> str:
+def compute_content_hash(
+    content: str,
+    tenant_id: str,
+    modality: "Modality" | None = None,
+) -> str:
     """
     CANONICAL content hash computation for deduplication.
 
     ALL code that needs to compute content hashes MUST use this function.
     Do NOT duplicate this logic elsewhere.
 
-    Format: SHA256("{embedding_model}:{content}")
+    Format: SHA256("{tenant_id}:{modality.value}:{content}")
 
     Design decisions:
-    - Model ID comes FIRST because it's the discriminator
-    - Full SHA256 hash (64 hex chars) for collision resistance
-    - Same content + different model = different hash (by design)
+    - Tenant ID comes FIRST for explicit tenant scoping (GDPR/compliance).
+    - Modality is included so TEXT vs IMAGE (etc.) are distinct.
+    - Full SHA256 hash (64 hex chars) for collision resistance.
+    - Same content + same tenant + same modality = same hash.
     """
 
-    hash_input = f"{embedding_model}:{content}"
+    # Default to TEXT when modality is not provided.
+    modality_str = getattr(modality, "value", "text")
+    hash_input = f"{tenant_id}:{modality_str}:{content}"
+    return hashlib.sha256(hash_input.encode()).hexdigest()
+
+
+def compute_vector_id(
+    content_hash: str,
+    embedding_model: str,
+    prefix: str = "text",
+) -> str:
+    """
+    Compute a deterministic vector ID from content+model.
+
+    Format: "{prefix}:{content_hash}:{model_hash}"
+    The model_hash ensures that the same content embedded with different
+    models gets distinct vector IDs.
+    """
+    model_hash = hashlib.sha256(embedding_model.encode()).hexdigest()[:16]
+    return f"{prefix}:{content_hash}:{model_hash}"
+
+
+def compute_document_hash(content: str, tenant_id: str) -> str:
+    """
+    Tenant-scoped DOCUMENT hash for document-level deduplication.
+
+    This intentionally does *not* depend on the embedding model so that
+    the same normalized document content within a tenant always maps to
+    the same hash, regardless of embedding configuration.
+
+    Format: SHA256("{tenant_id}:{content}")
+    """
+
+    hash_input = f"{tenant_id}:{content}"
     return hashlib.sha256(hash_input.encode()).hexdigest()
 
 
@@ -325,6 +363,65 @@ class BoundingBox:
 
 
 @dataclass
+class SourceLocation:
+    """
+    Canonical (document, chunk) location for provenance tracking.
+ 
+    Keeps explicit (document_id, chunk_index) pairs for accurate provenance.
+    """
+ 
+    document_id: str
+    chunk_index: int
+ 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "document_id": self.document_id,
+            "chunk_index": self.chunk_index,
+        }
+ 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SourceLocation":
+        return cls(
+            document_id=data["document_id"],
+            chunk_index=data["chunk_index"],
+        )
+
+
+def normalize_relation_type(rel: str) -> str:
+    """Normalize a relation type for consistent storage across backends.
+
+    Uppercases and replaces spaces with underscores so that the same string
+    is used in both NetworkX and Neo4j (where relationship types are
+    conventionally UPPER_SNAKE_CASE).
+    """
+    return rel.strip().upper().replace(" ", "_")
+
+
+def source_locations_to_parallel_arrays(
+    locs: List["SourceLocation"],
+) -> Dict[str, List]:
+    """Convert SourceLocation list to parallel arrays for graph-store storage.
+
+    Neo4j only supports arrays of primitives, so we store provenance as two
+    aligned lists rather than a list of objects.
+    """
+    return {
+        "source_doc_ids": [loc.document_id for loc in locs],
+        "source_chunk_indices": [loc.chunk_index for loc in locs],
+    }
+
+
+def parallel_arrays_to_source_locations(
+    doc_ids: List[str], chunk_indices: List[int]
+) -> List["SourceLocation"]:
+    """Reconstruct SourceLocation list from parallel arrays."""
+    return [
+        SourceLocation(document_id=d, chunk_index=i)
+        for d, i in zip(doc_ids, chunk_indices)
+    ]
+
+
+@dataclass
 class SourceReference:
     """
     Reference to the source where content was extracted.
@@ -356,6 +453,37 @@ class SourceReference:
 # ============================================================================
 
 
+def make_entity_id(name: str, tenant_id: str) -> str:
+    """Deterministic entity ID from name and tenant.
+
+    The ID is intentionally name-only (no ``entity_type``) so that the same
+    real-world entity extracted from different documents, or with varying type
+    labels across extraction runs, always maps to the **same** graph node.
+    This is the desired merge-by-name behaviour for knowledge graphs.
+
+    Collision risk
+    --------------
+    Two genuinely different entities that share a name (e.g. "Python" the
+    snake vs "Python" the language) will share a node.  When that matters,
+    differentiate at query time using the ``entity_type`` property stored on
+    the ``EntityNode``, or use the surrounding relationship context.
+    The extractor's ``source_type`` / ``target_type`` hints (stored as edge
+    properties on ``GraphEdge``) can also aid disambiguation without
+    requiring separate nodes.
+
+    node_type vs entity_type
+    ------------------------
+    ``node_type`` (``NodeType`` enum) is a structural graph meta-field that
+    classifies *graph node kinds* (PAGE, PASSAGE, ENTITY, …).  It must
+    never be conflated with ``entity_type``, which is a domain label
+    assigned by the knowledge-graph extractor (e.g. "Person", "Concept").
+    ``EntityNode.node_type`` is always ``NodeType.ENTITY``; the extractor's
+    label lives in ``EntityNode.entity_type``.
+    """
+    normalized = name.strip().lower()
+    return f"entity:{tenant_id}:{normalized}"
+
+
 @dataclass
 class Entity:
     """
@@ -366,20 +494,16 @@ class Entity:
     - ExtractedEntity from MMKG_DESIGN
     """
 
-    id: str
-    name: str
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
     entity_type: str = "entity"
-    description: str = ""  # Rich text description
+    description: str = ""
 
     # Embedding for retrieval
     embedding: Optional[List[float]] = None
 
-    # Source provenance - optional for backward compat
-    sources: List[SourceReference] = field(default_factory=list)
-
-    # Reference counting for cascade delete
-    source_chunk_ids: Set[str] = field(default_factory=set)
-    source_doc_ids: Set[str] = field(default_factory=set)
+    # Canonical provenance: explicit (document_id, chunk_index) pairs
+    source_locations: List[SourceLocation] = field(default_factory=list)
 
     # Confidence from extraction (0-1)
     confidence: float = 1.0
@@ -390,29 +514,43 @@ class Entity:
     # Namespace for isolation
     namespace: str = "default"
 
-    def get_embedding_text(self) -> str:
-        """Text representation for embedding generation."""
+    def add_source(self, document_id: str, chunk_id: str):
+        """Add a source reference to source_locations."""
+        try:
+            idx = int(chunk_id)
+        except (TypeError, ValueError):
+            return
 
+        loc = SourceLocation(document_id=document_id, chunk_index=idx)
+        if loc not in self.source_locations:
+            self.source_locations.append(loc)
+
+    def get_embedding_text(self) -> str:
+        """Text representation for embedding generation.
+
+        Includes the entity_type when available so that embeddings capture
+        lightweight type information without over-fragmenting IDs.
+        """
+        parts: List[str] = [self.name]
+        # Avoid repeating the default generic label
+        if self.entity_type and self.entity_type != "entity":
+            parts.append(f"({self.entity_type})")
         if self.description:
-            return f"{self.name}: {self.description}"
-        return self.name
+            parts.append(f": {self.description}")
+        return " ".join(parts)
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize to dictionary for storage.
-
-        NOTE: Converts Set fields to List for JSON compatibility.
-        """
-
+        """Serialize to dictionary for storage."""
         return {
             "id": self.id,
             "name": self.name,
             "entity_type": self.entity_type,
             "description": self.description,
             "embedding": self.embedding,
-            "sources": [s.__dict__ for s in self.sources],
-            "source_chunk_ids": list(self.source_chunk_ids),
-            "source_doc_ids": list(self.source_doc_ids),
+            "source_locations": [
+                {"document_id": loc.document_id, "chunk_index": loc.chunk_index}
+                for loc in self.source_locations
+            ],
             "confidence": self.confidence,
             "properties": self.properties,
             "namespace": self.namespace,
@@ -420,22 +558,24 @@ class Entity:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Entity":
-        """
-        Deserialize from dictionary.
+        """Deserialize from dictionary."""
+        raw_locs = data.get("source_locations", [])
+        source_locations: List[SourceLocation] = [
+            SourceLocation(
+                document_id=loc["document_id"],
+                chunk_index=loc["chunk_index"],
+            )
+            for loc in raw_locs
+            if "document_id" in loc and "chunk_index" in loc
+        ]
 
-        NOTE: Converts List fields back to Set.
-        """
-
-        sources = [SourceReference(**s) for s in data.get("sources", [])]
         return cls(
             id=data["id"],
             name=data["name"],
             entity_type=data.get("entity_type", "entity"),
             description=data.get("description", ""),
             embedding=data.get("embedding"),
-            sources=sources,
-            source_chunk_ids=set(data.get("source_chunk_ids", [])),
-            source_doc_ids=set(data.get("source_doc_ids", [])),
+            source_locations=source_locations,
             confidence=data.get("confidence", 1.0),
             properties=data.get("properties", {}),
             namespace=data.get("namespace", "default"),
@@ -471,9 +611,8 @@ class Relation:
     # Embedding for retrieval
     embedding: Optional[List[float]] = None
 
-    # Source provenance
-    sources: List[SourceReference] = field(default_factory=list)
-    source_chunk_ids: Set[str] = field(default_factory=set)
+    # Canonical provenance: explicit (document_id, chunk_index) pairs
+    source_locations: List[SourceLocation] = field(default_factory=list)
 
     # Edge semantics
     weight: float = 1.0
@@ -487,13 +626,30 @@ class Relation:
     # Namespace for isolation
     namespace: str = "default"
 
-    def get_embedding_text(self) -> str:
-        """Text representation for embedding generation."""
+    def add_source(self, document_id: str, chunk_id: str) -> None:
+        """Add a source reference to source_locations."""
+        try:
+            idx = int(chunk_id)
+        except (TypeError, ValueError):
+            return
+        loc = SourceLocation(document_id=document_id, chunk_index=idx)
+        if loc not in self.source_locations:
+            self.source_locations.append(loc)
 
-        kw = ", ".join(self.keywords) if self.keywords else ""
+    def get_embedding_text(self) -> str:
+        """Text representation for embedding generation.
+
+        Incorporates description, inverse_relation and keywords when available
+        so that semantically richer embeddings are produced.
+        """
+        parts = [f"{self.subject} {self.predicate} {self.object}"]
         if self.description:
-            return f"{self.predicate}: {self.description} (keywords: {kw})"
-        return f"{self.subject} {self.predicate} {self.object}"
+            parts.append(self.description)
+        if self.inverse_relation:
+            parts.append(f"(inverse: {self.object} {self.inverse_relation} {self.subject})")
+        if self.keywords:
+            parts.append(f"[{', '.join(self.keywords)}]")
+        return " | ".join(parts)
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -510,8 +666,39 @@ class Relation:
             "object": self.object,
             "object_id": self.object_id,
             "confidence": self.confidence,
-            "source_ids": [s.source_id for s in self.sources] if self.sources else [],
+            "source_locations": [
+                {"document_id": loc.document_id, "chunk_index": loc.chunk_index}
+                for loc in self.source_locations
+            ],
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Relation":
+        """Deserialize from dictionary."""
+        raw_locs = data.get("source_locations", [])
+        source_locations: List[SourceLocation] = [
+            SourceLocation(document_id=loc["document_id"], chunk_index=loc["chunk_index"])
+            for loc in raw_locs
+            if "document_id" in loc and "chunk_index" in loc
+        ]
+
+        return cls(
+            id=data.get("id", str(uuid.uuid4())),
+            subject_id=data.get("subject_id", ""),
+            predicate=data.get("predicate", ""),
+            object_id=data.get("object_id", ""),
+            subject=data.get("subject", ""),
+            object=data.get("object", ""),
+            description=data.get("description", ""),
+            keywords=data.get("keywords", []),
+            source_locations=source_locations,
+            weight=data.get("weight", 1.0),
+            confidence=data.get("confidence", 1.0),
+            is_bidirectional=data.get("is_bidirectional", False),
+            inverse_relation=data.get("inverse_relation"),
+            properties=data.get("properties", {}),
+            namespace=data.get("namespace", "default"),
+        )
 
 
 # ============================================================================
@@ -540,9 +727,8 @@ class BaseGraphNode:
     node_type: NodeType
     content: str
 
-    # Source tracking for cascade delete
-    source_chunk_ids: Set[str] = field(default_factory=set)
-    source_doc_ids: Set[str] = field(default_factory=set)
+    # Canonical provenance
+    source_locations: List[SourceLocation] = field(default_factory=list)
 
     # Namespace for isolation
     namespace: str = "default"
@@ -571,16 +757,17 @@ class EntityNode(BaseGraphNode):
 class PassageNode(BaseGraphNode):
     """Graph node representing a text passage/chunk."""
 
-    # Passage-specific: document position
-    chunk_index: int = 0
     page_number: Optional[int] = None
-    document_id: str = ""
 
     # Entities mentioned in this passage
     mentioned_entity_ids: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.node_type = NodeType.PASSAGE
+
+    @staticmethod
+    def make_id(tenant_id: str, content_hash: str) -> str:
+        return f"passage:{tenant_id}:{content_hash}"
 
 
 @dataclass
@@ -604,6 +791,10 @@ class PageNode(BaseGraphNode):
     def __post_init__(self) -> None:
         self.node_type = NodeType.PAGE
 
+    @staticmethod
+    def make_id(document_id: str, page_number: int) -> str:
+        return f"page:{document_id}:{page_number}"
+
 
 # Type alias for any graph node (use for functions that accept any node type)
 GraphNode = Union[EntityNode, PassageNode, PageNode]
@@ -623,8 +814,12 @@ class GraphEdge:
     is_bidirectional: bool = False
     inverse_relation: Optional[str] = None
 
-    # Source tracking for cascade delete
-    source_chunk_ids: Set[str] = field(default_factory=set)
+    # Optional denormalised names for embedding / display
+    source_entity_name: str = ""
+    target_entity_name: str = ""
+
+    # Canonical provenance
+    source_locations: List[SourceLocation] = field(default_factory=list)
 
     # Namespace
     namespace: str = "default"
@@ -717,7 +912,7 @@ class Memory:
                 f"{[l.value for l in valid_layers]}"
             )
 
-    def get_content_hash(self, embedding_model: str) -> str:
+    def get_content_hash(self, tenant_id: str) -> str:
         """
         Get content hash using canonical function.
 
@@ -725,7 +920,7 @@ class Memory:
         to the canonical compute_content_hash() function.
         """
 
-        return compute_content_hash(self.content, embedding_model)
+        return compute_content_hash(self.content, tenant_id)
 
 
 # ============================================================================
@@ -849,14 +1044,14 @@ class Chunk:
 
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def get_content_hash(self, embedding_model: str) -> str:
+    def get_content_hash(self, tenant_id: str) -> str:
         """
         Get content hash using canonical function.
 
         Delegates to compute_content_hash().
         """
 
-        return compute_content_hash(self.content, embedding_model)
+        return compute_content_hash(self.content, tenant_id)
 
 
 # Type alias for chunker factory used in interfaces
