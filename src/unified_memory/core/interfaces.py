@@ -118,6 +118,14 @@ class SparseRetriever(Protocol):
     have different storage requirements (inverted index).
     """
 
+    async def add_namespace(
+        self,
+        content_id: str,
+        namespace: str,
+    ) -> bool:
+        """Add a namespace to an existing document."""
+        ...
+
     async def index(
         self,
         documents: List[Dict[str, Any]],
@@ -129,7 +137,7 @@ class SparseRetriever(Protocol):
     async def retrieve(
         self,
         query: str,
-        namespace: str,
+        namespaces: List[str],
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
@@ -140,6 +148,7 @@ class SparseRetriever(Protocol):
         self,
         doc_ids: List[str],
         namespace: str,
+        document_id: Optional[str] = None,
     ) -> int:
         """Delete documents from sparse index. Returns count deleted."""
         ...

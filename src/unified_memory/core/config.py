@@ -80,10 +80,9 @@ class IngestionConfig:
         )
         
         # 4. Collections
-        text_collection = (
-            ns.get("text_collection") or 
-            f"tenant_{tenant.get('tenant_id', 'default')}_texts"
-        )
+        # IMPORTANT: Keep naming consistent with NamespaceConfig.__post_init__
+        # which uses f"{tenant_id}_texts" (no "tenant_" prefix).
+        text_collection = ns.get("text_collection") or f"{tenant.get('tenant_id', 'default')}_texts"
         
         return cls(
             chunk_size=chunk_size,
