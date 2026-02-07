@@ -46,11 +46,9 @@ class NamespaceManager:
     def __init__(
         self,
         kv_store: KVStoreBackend,
-        enable_multi_tenant: bool = True,
         default_scope: str = "private",
     ) -> None:
         self.kv_store = kv_store
-        self.enable_multi_tenant = enable_multi_tenant
         self.default_scope = default_scope
 
     async def get_config(self, namespace: str) -> Optional[NamespaceConfig]:

@@ -26,6 +26,52 @@ class EmbeddingModelConfig:
 
 
 @dataclass
+class ExtractionConfig:
+    """
+    Configuration for entity / relation extraction.
+
+    Mirrors COMPREHENSIVE_CODEBASE_ANALYSIS.md and is used by the ingestion
+    pipeline to post-filter extractor output.
+    """
+
+    extractor_type: str = "llm"  # e.g. "llm", "regex", "ner"
+    llm_model: Optional[str] = None
+    entity_types: List[str] = field(default_factory=list)  # allowed entity types
+    relation_types: List[str] = field(default_factory=list)  # allowed relation types
+    confidence_threshold: float = 0.5  # reserved for future use
+    batch_size: int = 10
+
+    # When True, entities/relations whose type is NOT in entity_types /
+    # relation_types are silently dropped.  When False (default), the lists
+    # act as an optional hint and no filtering occurs; this is the safe
+    # default because LLM-generated type labels are inherently open-ended
+    # and a closed list would discard valid extractions.
+    strict_type_filtering: bool = False
+
+
+@dataclass
+class IndexConfig:
+    """Vector index tuning parameters.
+
+    Propagated to the vector store backend when creating tenant collections.
+
+    Supported index_type values:
+    - ``"hnsw"`` (default) — graph-based approximate nearest-neighbour.
+    - ``"flat"`` — brute-force exact search; useful for small collections.
+    - ``"ivf_sq"`` — IVF with scalar quantisation (Qdrant's scalar quantizer).
+      Trades a small accuracy loss for reduced memory and faster search at
+      large scale.  Use ``ivf_sq_quantile`` to control the quantisation
+      clipping percentile (Qdrant default 0.99).
+    """
+
+    index_type: str = "hnsw"  # "hnsw", "flat", or "ivf_sq"
+    hnsw_m: int = 16
+    hnsw_ef_construct: int = 100
+    # IVF/SQ parameters (only used when index_type == "ivf_sq")
+    ivf_sq_quantile: float = 0.99  # Qdrant ScalarQuantizationConfig.quantile
+
+
+@dataclass
 class TenantConfig:
     """
     Tenant-level configuration.
@@ -51,6 +97,33 @@ class TenantConfig:
             dimension=512,
         )
     )
+    # Phase 1.5 & Section 3.1: Tenant Ingestion Config
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    chunker_type: str = "fixed_size"  # fixed_size, recursive, semantic
+    respect_sentence_boundaries: bool = True
+
+    # Vector index tuning
+    index: IndexConfig = field(default_factory=IndexConfig)
+
+    # Controls how many characters of a page's full_text are stored as the
+    # PageNode's content field.  Kept short (default 200) so that graph nodes
+    # are lightweight; the full text is always retrievable from ContentStore.
+    # Increase when you need richer context on page nodes for graph traversal.
+    page_snippet_length: int = 200
+
+    # Extraction & Graph settings
+    enable_graph_storage: bool = True
+    # Controls whether visual (image) embeddings are created during ingestion.
+    enable_visual_indexing: bool = True
+    enable_entity_extraction: bool = True
+    enable_relation_extraction: bool = True
+    extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
+
+    # Processing settings
+    batch_size: int = 100
+    deduplication_enabled: bool = True
+
     created_at: str = field(default_factory=lambda: utc_now().isoformat())
     updated_at: str = ""
 
@@ -233,12 +306,14 @@ class RetrievalConfig:
     - Whether to rerank
     """
 
-    embedding_model: str
     fusion_method: str = "rrf"
     rerank: bool = False
     top_k: int = 10
+    rerank_candidates_limit: int = 50  # Max candidates passed to reranker 
     paths: List[str] = field(default_factory=lambda: ["dense", "sparse", "graph"])
     score_threshold: Optional[float] = None
+    # Optional per-request fusion weights (used when fusion_method == "linear")
+    fusion_weights: Optional[Dict[str, float]] = None
     
     @classmethod
     async def resolve(
@@ -256,8 +331,7 @@ class RetrievalConfig:
         # Get namespace config to find tenant
         ns_config = await namespace_manager.get_config(namespace)
         if not ns_config:
-             # Fallback if namespace doesn't exist (shouldn't happen in valid flow)
-            return cls(embedding_model="text-embedding-3-small")
+            raise ValueError(f"Namespace not found: {namespace}")
 
         # Get tenant config for defaults
         tenant_config = await namespace_manager.get_tenant_config(ns_config.tenant_id)
@@ -265,11 +339,11 @@ class RetrievalConfig:
         request = request_options or {}
         
         return cls(
-            embedding_model=request.get("embedding_model") 
-                or tenant_config.text_embedding.model,
             fusion_method=request.get("fusion_method", "rrf"),
             rerank=request.get("rerank", False),
             top_k=request.get("top_k", 10),
+            rerank_candidates_limit=request.get("rerank_candidates_limit", 50),
             paths=request.get("paths", ["dense", "sparse", "graph"]),
             score_threshold=request.get("score_threshold"),
+            fusion_weights=request.get("fusion_weights"),
         )
