@@ -84,39 +84,35 @@ class TenantManager:
     async def register_tenant(
         self,
         tenant_id: str,
-        text_model: str = "text-embedding-3-small",
-        image_model: Optional[str] = None
+        text_embedding: Optional[EmbeddingModelConfig] = None,
+        vision_embedding: Optional[EmbeddingModelConfig] = None,
     ) -> TenantConfig:
-        """Helper to register a new tenant."""
-        
-        text_config = EmbeddingModelConfig(
-            provider="openai", # Defaulting to OpenAI for now
-            model=text_model,
-            dimension=1536 if "small" in text_model else 3072,
-        )
-        
-        vision_config = None
-        if image_model:
-             vision_config = EmbeddingModelConfig(
+        """
+        Helper to register a new tenant.
+
+        Design alignment:
+        - Accept full EmbeddingModelConfig objects instead of bare model strings.
+        - Provide sensible defaults when configs are not supplied.
+        """
+
+        # Default text embedding model if not provided
+        if text_embedding is None:
+            text_embedding = EmbeddingModelConfig(
                 provider="openai",
-                model=image_model,
-                dimension=512,
+                model="text-embedding-3-small",
+                dimension=1536,
             )
-            
-        # Create config. Note: TenantConfig uses default_factory if not provided
-        # We need to construct it carefully
-        
-        # If I use constructor:
-        # TenantConfig(tenant_id=..., text_embedding=..., vision_embedding=...)
-        
+
         kw_args = {
             "tenant_id": tenant_id,
-            "text_embedding": text_config,
+            "text_embedding": text_embedding,
         }
-        if vision_config:
-            kw_args["vision_embedding"] = vision_config
-            
+
+        # Optional vision embedding override (otherwise TenantConfig default applies)
+        if vision_embedding is not None:
+            kw_args["vision_embedding"] = vision_embedding
+
         config = TenantConfig(**kw_args)
-        
+
         await self.set_tenant_config(tenant_id, config)
         return config
