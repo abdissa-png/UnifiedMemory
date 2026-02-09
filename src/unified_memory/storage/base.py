@@ -168,8 +168,14 @@ class VectorStoreBackend(ABC):
         dimension: int,
         distance_metric: str = "cosine",
         index_type: str = "hnsw",
+        **kwargs: Any,
     ) -> bool:
-        """Create a new collection."""
+        """Create a new collection.
+
+        Accepts backend-specific keyword arguments (e.g. ``hnsw_m``,
+        ``hnsw_ef_construct``, ``ivf_sq_quantile``) forwarded by callers
+        that are aware of the concrete backend in use.
+        """
 
         raise NotImplementedError
 
@@ -230,11 +236,12 @@ class VectorStoreBackend(ABC):
         self,
         ids: List[str],
         collection: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> List[VectorSearchResult]:
         """
         Batch get vectors by IDs.
         
-        FIX for batch operations: Avoids N+1 queries when fetching multiple vectors.
+        If namespace is provided, only return vectors that have that namespace.
         Returns list of VectorSearchResult (may be shorter than input if some IDs don't exist).
         """
 
@@ -276,6 +283,32 @@ class VectorStoreBackend(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    async def add_namespace(
+        self,
+        id: str,
+        namespace: str,
+        collection: Optional[str] = None,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        """Add a namespace to an existing vector's metadata."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def remove_namespace(
+        self,
+        id: str,
+        namespace: str,
+        collection: Optional[str] = None,
+        document_id: Optional[str] = None,
+    ) -> Tuple[bool, bool]:
+        """
+        Remove a namespace from a vector.
+        
+        Returns (success, was_last_namespace).
+        """
+        raise NotImplementedError
+
 
 class VectorStoreTransaction:
     """
@@ -314,7 +347,7 @@ class VectorStoreTransaction:
         collection: Optional[str] = None,
     ) -> int:
         # Save current state for rollback (using batch method for efficiency)
-        saved_vectors_raw = await self._store.get_by_ids(ids, collection)
+        saved_vectors_raw = await self._store.get_by_ids(ids, collection, namespace=namespace)
         saved_vectors: List[Dict[str, Any]] = []
         for vec in saved_vectors_raw:
             saved_vectors.append(
@@ -501,3 +534,64 @@ class GraphStoreBackend(Protocol):
         """
         ...
 
+    async def add_namespace(
+        self,
+        id: str,
+        namespace: str,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        """Add a namespace to an existing node or edge (convenience: tries node, then edge)."""
+        ...
+
+    async def add_namespace_to_node(
+        self,
+        node_id: str,
+        namespace: str,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        """Add a namespace to an existing node."""
+        ...
+
+    async def add_namespace_to_edge(
+        self,
+        edge_id: str,
+        namespace: str,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        """Add a namespace to an existing edge."""
+        ...
+
+    async def remove_namespace(
+        self,
+        id: str,
+        namespace: str,
+    ) -> Tuple[bool, bool]:
+        """Remove a namespace from a node or edge (convenience: tries node, then edge).
+
+        Returns (success, was_last_namespace).
+        """
+        ...
+
+    async def remove_namespace_from_node(
+        self,
+        node_id: str,
+        namespace: str,
+    ) -> Tuple[bool, bool]:
+        """Remove a namespace from a node.
+
+        Returns (success, was_last_namespace).
+        If the node has no remaining namespaces it is deleted.
+        """
+        ...
+
+    async def remove_namespace_from_edge(
+        self,
+        edge_id: str,
+        namespace: str,
+    ) -> Tuple[bool, bool]:
+        """Remove a namespace from an edge.
+
+        Returns (success, was_last_namespace).
+        If the edge has no remaining namespaces it is deleted.
+        """
+        ...
