@@ -30,11 +30,16 @@ class ContentStore:
         self._store = kv_store
     
     def _key(self, content_id: str) -> str:
+        # If it's already prefixed, don't prefix again
+        if content_id.startswith("content:"):
+            return content_id
         return f"content:{content_id}"
     
     async def get_content(self, content_id: str) -> Optional[str]:
         """Retrieve content payload."""
-        versioned = await self._store.get(self._key(content_id))
+        # Try as is first, then with prefix if needed
+        key = self._key(content_id)
+        versioned = await self._store.get(key)
         if not versioned:
             return None
         return versioned.data.get("payload")
