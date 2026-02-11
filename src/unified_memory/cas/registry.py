@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
+import asyncio
 
 from unified_memory.core.types import utc_now
 from unified_memory.storage.base import KVStoreBackend
@@ -134,7 +135,6 @@ class CASRegistry:
         """
         Add a usage reference to a CAS entry with optimistic locking.
         """
-        import asyncio
         key = self._key(content_hash)
         
         # Retry loop for CAS (Compare-And-Swap)
@@ -178,34 +178,65 @@ class CASRegistry:
         content_hash: str,
         namespace: str,
         document_id: str,
-        chunk_index: int = None,
+        chunk_index: Optional[int] = None,
     ) -> bool:
-        """Remove a reference."""
+        """Remove a reference using CAS loop."""
+        key = self._key(content_hash)
+        
+        for attempt in range(5):
+            versioned = await self._store.get(key)
+            if not versioned:
+                return False
+                
+            entry = CASEntry.from_dict(versioned.data)
+            original_len = len(entry.refs)
+            
+            # Filter refs
+            new_refs = []
+            for r in entry.refs:
+                is_target = (r.namespace == namespace and r.document_id == document_id)
+                if chunk_index is not None:
+                     is_target = is_target and (r.chunk_index == chunk_index)
+                
+                if not is_target:
+                    new_refs.append(r)
+            
+            if len(new_refs) == original_len:
+                return False # Reference found? No, if lengths equal, nothing removed.
+            
+            entry.refs = new_refs
+            
+            # CAS Update
+            success = await self._store.compare_and_swap(
+                key, versioned.version, entry.to_dict()
+            )
+            
+            if success:
+                return True
+                
+            await asyncio.sleep(0.01 * (attempt + 1))
+            
+        return False
+    
+    async def delete_if_orphan(self, content_hash: str) -> bool:
+        """
+        Delete CAS entry if it has no references remaining.
+
+        This is used by higher-level delete flows after references have been
+        removed via remove_reference().
+        """
         key = self._key(content_hash)
         versioned = await self._store.get(key)
         if not versioned:
             return False
-            
+
         entry = CASEntry.from_dict(versioned.data)
-        
-        # Filter out the reference
-        original_len = len(entry.refs)
-        if chunk_index is not None:
-             entry.refs = [r for r in entry.refs 
-                          if not (r.namespace == namespace and 
-                                  r.document_id == document_id and
-                                  r.chunk_index == chunk_index)]
-        else:
-            # Remove all refs for this doc
-             entry.refs = [r for r in entry.refs 
-                          if not (r.namespace == namespace and 
-                                  r.document_id == document_id)]
-        
-        if len(entry.refs) != original_len:
-            await self._store.set(key, entry.to_dict())
-            return True
-            
-        return False
+        if entry.refs:
+            # Still referenced somewhere, do not delete.
+            return False
+
+        # Safe to delete if version matches (avoid races).
+        return await self._store.delete_if_version(key, versioned.version)
     
     async def get_orphans(self) -> List[str]:
         """
