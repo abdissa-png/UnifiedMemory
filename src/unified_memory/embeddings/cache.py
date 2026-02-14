@@ -81,11 +81,12 @@ class CachedEmbeddingProvider(EmbeddingProvider):
     def _compute_cache_key(self, content: Any, modality: Modality) -> str:
         """
         Compute cache key from content.
-        
-        Uses canonical hash: SHA256("{model_id}:{content}")
+
+        Uses canonical hash helper shared with the ingestion pipeline so that
+        identical (content, model_id, modality) triples map to the same key.
         """
         content_str = content if isinstance(content, str) else str(content)
-        return compute_content_hash(content_str, self.model_id)
+        return compute_content_hash(content_str, self.model_id, modality)
     
     async def embed(
         self,

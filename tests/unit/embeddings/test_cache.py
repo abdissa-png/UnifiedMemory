@@ -55,38 +55,30 @@ async def test_batch_cache(cached_provider, mock_provider):
     assert len(mock_provider.embed_calls) == 3
 
 @pytest.mark.asyncio
-async def test_different_modalities_cache(cached_provider):
+async def test_different_modalities_cache(cached_provider, mock_provider):
     # Mock provider needs to support image for this test
-    cached_provider._base._modalities.append(Modality.IMAGE)
+    # Access private _modalities list (MockEmbeddingProvider implementation detail)
+    mock_provider._modalities.append(Modality.IMAGE)
     
     content = "same bytes"
     
-    # Text embedding
+    # 1. Text embedding
     emb1 = await cached_provider.embed(content, Modality.TEXT)
+    # Cache miss
+    assert cached_provider.cache_stats["misses"] == 1
     
-    # Image embedding (mocked)
+    # 2. Image embedding (mocked)
     emb2 = await cached_provider.embed(content, Modality.IMAGE)
+    # Should be another cache miss because key differs
+    assert cached_provider.cache_stats["misses"] == 2
     
-    # Should be different cache keys because of model/modality hash logic?
-    # Wait, compute_cache_key uses model_id + content.
-    # Does it include modality?
-    # The base CachedEmbeddingProvider uses compute_content_hash(content, model_id).
-    # If model_id is same, hash is same. PROBELM?
-    # Ah, EmbeddingProvider base usually implies model_id is specific to the model being used.
-    # If one model supports multiple modalities (like CLIP), the model_id is usually same.
-    # BUT CLIP has separate encoders. Usually you have text_model and vision_model.
-    # If we reuse same provider...
+    # Verify keys are different in internal cache
+    # Implementation detail: cache keys are hashes of "model_id:modality:content"
+    # We can inspect _cache to verify there are 2 entries
+    assert len(cached_provider._cache) == 2
     
-    # Let's check CachedEmbeddingProvider._compute_cache_key
-    # It uses compute_content_hash(content, model_id).
-    # If model_id is constant "mock-embedding-model", then hash is same for same content string.
-    # This means Text and Image embedding for "same bytes" would be cached same!
-    
-    # Does this matter? 
-    # If content "cat" is text, embedding is X.
-    # If content "cat" is image bytes (unlikely collision), embedding is Y.
-    # Yes, potential collision if raw content bytes are identical across modalities.
-    # But usually content types differ.
-    
-    # For this test, let's assume content differs
-    pass
+    # Verify calling text again hits cache
+    emb1_again = await cached_provider.embed(content, Modality.TEXT)
+    assert cached_provider.cache_stats["misses"] == 2
+    assert cached_provider.cache_stats["hits"] == 1
+    assert emb1 == emb1_again
