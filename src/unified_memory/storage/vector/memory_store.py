@@ -19,6 +19,11 @@ class MemoryVectorStore(VectorStoreBackend):
     
     Uses exact cosine similarity search (brute force) with numpy.
     Collections are simulated as separate dictionaries.
+    
+    NAMESPACE ARRAY MIGRATION:
+    - Vectors now store `namespaces: List[str]` instead of `namespace: str`.
+    - Backward compat: reads both `namespaces` (new) and `namespace` (old).
+    - Search matches if query namespace is IN the namespaces list.
     """
 
     def __init__(self) -> None:
@@ -30,14 +35,23 @@ class MemoryVectorStore(VectorStoreBackend):
         
         self._lock = asyncio.Lock()
 
+    def _get_namespaces(self, vec: Dict[str, Any]) -> List[str]:
+        """Extract namespaces list from a stored vector (backward compat)."""
+        if "namespaces" in vec:
+            return vec["namespaces"]
+        if "namespace" in vec:
+            return [vec["namespace"]]
+        return []
+
     async def create_collection(
         self,
         name: str,
         dimension: int,
         distance_metric: str = "cosine",
         index_type: str = "hnsw",
+        **kwargs,
     ) -> bool:
-        """Create a new collection."""
+        """Create a new collection (in-memory; backend-specific kwargs are ignored)."""
         async with self._lock:
             if name in self._collections:
                 return False
@@ -73,8 +87,17 @@ class MemoryVectorStore(VectorStoreBackend):
         namespace: str = "default",
         collection: Optional[str] = None,
     ) -> int:
-        """Upsert vectors."""
-        target_collection = collection or namespace
+        """
+        Upsert vectors. Stores namespace as namespaces list.
+
+        NOTE: `collection` is required; using `namespace` as a fallback collection
+        name is no longer supported to avoid ambiguity between logical namespaces
+        and physical collections.
+        """
+        if collection is None:
+            raise ValueError("collection must be specified for MemoryVectorStore.upsert")
+
+        target_collection = collection
         
         async with self._lock:
             if target_collection not in self._collections:
@@ -86,22 +109,130 @@ class MemoryVectorStore(VectorStoreBackend):
             
             for vec in vectors:
                 vec_id = vec["id"]
+                
+                # If vector already exists, merge namespaces
+                existing = store.get(vec_id)
+                if existing:
+                    existing_ns = self._get_namespaces(existing)
+                    if namespace not in existing_ns:
+                        existing_ns.append(namespace)
+                    new_namespaces = existing_ns
+                else:
+                    new_namespaces = [namespace]
+                
                 # Deep copy to prevent mutation
                 stored_vec = {
                     "id": vec_id,
-                    "embedding": vec.get("embedding"), # Can be None for metadata-only updates
+                    "embedding": vec.get("embedding"),  # Can be None for metadata-only updates
                     "metadata": vec.get("metadata", {}).copy(),
-                    "namespace": namespace # Store namespace in metadata for filtering
+                    "namespaces": new_namespaces,
                 }
                 
                 # If updating existing, preserve embedding if new one is None
-                if vec_id in store and stored_vec["embedding"] is None:
-                     stored_vec["embedding"] = store[vec_id]["embedding"]
+                if existing and stored_vec["embedding"] is None:
+                    stored_vec["embedding"] = existing["embedding"]
+
+                # Extract and ensure source_doc_ids / source_locations exist in payload
+                metadata = stored_vec["metadata"]
+                doc_ids = set(metadata.get("source_doc_ids") or [])
+                if metadata.get("document_id"):
+                    doc_ids.add(metadata["document_id"])
+                
+                # Update existing doc_ids if merging
+                if existing:
+                    payload = existing.get("metadata", {})
+                    doc_ids.update(payload.get("source_doc_ids") or [])
+                    if payload.get("document_id"):
+                        doc_ids.add(payload["document_id"])
+                        
+                metadata["source_doc_ids"] = list(doc_ids)
+                
+                # Mirror namespaces to metadata for visibility
+                metadata["namespaces"] = new_namespaces
                 
                 store[vec_id] = stored_vec
                 count += 1
                 
             return count
+
+    async def add_namespace(
+        self,
+        id: str,
+        namespace: str,
+        collection: Optional[str] = None,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        """Add a namespace to an existing vector's namespace list."""
+        target_collections = [collection] if collection else list(self._collections.keys())
+        async with self._lock:
+            for col_name in target_collections:
+                if col_name in self._collections:
+                    store = self._collections[col_name]
+                    if id in store:
+                        ns_list = self._get_namespaces(store[id])
+                        if namespace not in ns_list:
+                            ns_list.append(namespace)
+                            store[id]["namespaces"] = ns_list
+                            # Sync to metadata
+                            store[id]["metadata"]["namespaces"] = ns_list
+                            
+                        # Handle document_id merging
+                        if document_id:
+                            metadata = store[id]["metadata"]
+                            doc_ids = set(metadata.get("source_doc_ids") or [])
+                            doc_ids.add(document_id)
+                            metadata["source_doc_ids"] = list(doc_ids)
+                            
+                        return True
+            return False
+
+    async def remove_namespace(
+        self,
+        id: str,
+        namespace: str,
+        collection: Optional[str] = None,
+        document_id: Optional[str] = None,
+    ) -> Tuple[bool, bool]:
+        """
+        Remove namespace from a vector's namespace list.
+        
+        Returns:
+            (success, was_last_namespace)
+        """
+        target_collections = [collection] if collection else list(self._collections.keys())
+        async with self._lock:
+            for col_name in target_collections:
+                if col_name in self._collections:
+                    store = self._collections[col_name]
+                    if id in store:
+                        ns_list = self._get_namespaces(store[id])
+                        if namespace in ns_list:
+                            ns_list.remove(namespace)
+                            
+                            payload = store[id]["metadata"]
+                            
+                            # Update source_doc_ids if present
+                            doc_ids = list(payload.get("source_doc_ids") or [])
+                            if document_id and document_id in doc_ids:
+                                doc_ids.remove(document_id)
+                                payload["source_doc_ids"] = doc_ids
+                                
+                            # Update source_locations if present
+                            locations = list(payload.get("source_locations") or [])
+                            if document_id:
+                                locations = [loc for loc in locations if loc.get("document_id") != document_id]
+                                payload["source_locations"] = locations
+
+                            if not ns_list:
+                                # Last namespace removed — hard delete
+                                del store[id]
+                                return True, True
+                                
+                            store[id]["namespaces"] = ns_list
+                            # Sync to metadata
+                            payload["namespaces"] = ns_list
+                            return True, False
+            return False, False
 
     async def get_by_id(
         self,
@@ -109,12 +240,8 @@ class MemoryVectorStore(VectorStoreBackend):
         collection: Optional[str] = None,
         namespace: str = "default",
     ) -> Optional[VectorSearchResult]:
-        """Get vector by ID."""
-        # Note: In real systems, we might search across collections if not specified,
-        # but here we require strict collection targeting or default to namespace behavior
-        # For simplicity in this mock, we search all if collection is None (inefficient)
-        
-        target_collections = [collection] if collection else [namespace] if namespace != "default" and namespace in self._collections else list(self._collections.keys())
+        """Get vector by ID. Returns None if namespace not in vector's namespaces."""
+        target_collections = [collection] if collection else list(self._collections.keys())
         
         async with self._lock:
             for col_name in target_collections:
@@ -124,6 +251,9 @@ class MemoryVectorStore(VectorStoreBackend):
                 store = self._collections[col_name]
                 if id in store:
                     vec = store[id]
+                    vec_ns = self._get_namespaces(vec)
+                    if namespace not in vec_ns:
+                        return None
                     return VectorSearchResult(
                         id=vec["id"],
                         score=1.0, # exact match
@@ -137,21 +267,22 @@ class MemoryVectorStore(VectorStoreBackend):
         self,
         ids: List[str],
         collection: Optional[str] = None,
+        namespace: Optional[str] = None,
     ) -> List[VectorSearchResult]:
-        """Batch get vectors by IDs."""
+        """Batch get vectors by IDs. If namespace given, filter by namespace in namespaces."""
         target_collections = [collection] if collection else list(self._collections.keys())
         results = []
         
         async with self._lock:
-            for id in ids:
-                found = False
+            for vec_id in ids:
                 for col_name in target_collections:
                     if col_name not in self._collections:
                         continue
-                        
                     store = self._collections[col_name]
-                    if id in store:
-                        vec = store[id]
+                    if vec_id in store:
+                        vec = store[vec_id]
+                        if namespace is not None and namespace not in self._get_namespaces(vec):
+                            break
                         results.append(VectorSearchResult(
                             id=vec["id"],
                             score=1.0,
@@ -159,8 +290,7 @@ class MemoryVectorStore(VectorStoreBackend):
                             metadata=vec["metadata"],
                             collection=col_name
                         ))
-                        found = True
-                        break # Stop checking other collections for this ID
+                        break
         return results
 
     async def delete(
@@ -169,20 +299,36 @@ class MemoryVectorStore(VectorStoreBackend):
         namespace: str = "default",
         collection: Optional[str] = None,
     ) -> int:
-        """Delete vectors by ID."""
-        target_collection = collection or namespace
-        
+        """
+        Delete vectors by ID for a specific namespace.
+
+        Implements ref-count semantics:
+        - Removes the given namespace from each vector's `namespaces` list.
+        - Hard-deletes the vector only when no namespaces remain.
+        """
+        if collection is None:
+            raise ValueError("collection must be specified for MemoryVectorStore.delete")
+
+        target_collection = collection
+
         async with self._lock:
             if target_collection not in self._collections:
                 return 0
-            
+
             store = self._collections[target_collection]
             count = 0
             for id in ids:
-                if id in store:
-                    # Verify namespace matches if we are being strict
-                    # But typically delete by ID is absolute
-                    del store[id]
+                if id not in store:
+                    continue
+                ns_list = self._get_namespaces(store[id])
+                if namespace in ns_list:
+                    ns_list.remove(namespace)
+                    if not ns_list:
+                        # Last namespace -> hard delete
+                        del store[id]
+                    else:
+                        store[id]["namespaces"] = ns_list
+                        store[id]["metadata"]["namespaces"] = ns_list
                     count += 1
             return count
 
@@ -192,28 +338,42 @@ class MemoryVectorStore(VectorStoreBackend):
         namespace: str = "default",
         collection: Optional[str] = None,
     ) -> int:
-        """Delete vectors matching filter."""
-        target_collection = collection or namespace
+        """
+        Delete vectors matching filter for a specific namespace.
+
+        Ref-count semantics:
+        - Remove the namespace from matched vectors' `namespaces` list.
+        - Hard-delete only when no namespaces remain.
+        """
+        if collection is None:
+            raise ValueError("collection must be specified for MemoryVectorStore.delete_by_filter")
+
+        target_collection = collection
         
         async with self._lock:
             if target_collection not in self._collections:
                 return 0
-                
+
             store = self._collections[target_collection]
-            to_delete = []
-            
-            for vec_id, vec in store.items():
-                # Implicit namespace filter
-                if vec.get("namespace") != namespace:
+            affected = 0
+
+            for vec_id, vec in list(store.items()):
+                vec_namespaces = self._get_namespaces(vec)
+                if namespace not in vec_namespaces:
                     continue
-                    
-                if self._matches_filter(vec["metadata"], filters):
-                    to_delete.append(vec_id)
-            
-            for vec_id in to_delete:
-                del store[vec_id]
-                
-            return len(to_delete)
+
+                if not self._matches_filter(vec["metadata"], filters):
+                    continue
+
+                vec_namespaces.remove(namespace)
+                if not vec_namespaces:
+                    del store[vec_id]
+                else:
+                    vec["namespaces"] = vec_namespaces
+                    vec["metadata"]["namespaces"] = vec_namespaces
+                affected += 1
+
+            return affected
 
     async def search(
         self,
@@ -241,13 +401,15 @@ class MemoryVectorStore(VectorStoreBackend):
                 return []
                 
             for vec in store.values():
-                # 1. Filter Check
-                # Namespace check (stored in metadata or explicit field)
-                if vec.get("namespace") != namespace:
+                # 1. Namespace array check
+                vec_namespaces = self._get_namespaces(vec)
+                if namespace not in vec_namespaces:
                     continue
                     
-                if filters and not self._matches_filter(vec["metadata"], filters):
-                    continue
+                if filters:
+                    matches = self._matches_filter(vec["metadata"], filters)
+                    if not matches:
+                        continue
                 
                 # 2. Embedding Check
                 doc_embedding = vec.get("embedding")
@@ -299,14 +461,16 @@ class MemoryVectorStore(VectorStoreBackend):
             results = []
             
             for vec in store.values():
-                if vec.get("namespace") != namespace:
+                # Namespace array check
+                vec_namespaces = self._get_namespaces(vec)
+                if namespace not in vec_namespaces:
                     continue
                     
                 if self._matches_filter(vec["metadata"], filters):
                     results.append({
                         "id": vec["id"],
                         "metadata": vec["metadata"],
-                        "namespace": vec["namespace"]
+                        "namespaces": vec_namespaces,
                     })
                     
                     if len(results) >= limit:
