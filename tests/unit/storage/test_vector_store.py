@@ -16,11 +16,13 @@ async def test_upsert_and_get(vector_store):
     count = await vector_store.upsert(vecs, namespace="ns1", collection="col1")
     assert count == 2
     
-    # Get by ID
-    res = await vector_store.get_by_id("v1", collection="col1")
+    # Get by ID (must pass namespace that matches the vector)
+    res = await vector_store.get_by_id("v1", collection="col1", namespace="ns1")
     assert res.id == "v1"
     assert res.embedding == [0.1, 0.2, 0.3]
-    assert res.metadata == {"tag": "a"} # Metadata stored as-is
+    assert res.metadata["tag"] == "a"
+    assert "namespaces" in res.metadata
+    assert "ns1" in res.metadata["namespaces"]
     
     # Get non-existent
     res = await vector_store.get_by_id("none", collection="col1")
@@ -91,8 +93,9 @@ async def test_delete(vector_store):
     vecs = [{"id": "v1", "embedding": [], "metadata": {}}]
     await vector_store.upsert(vecs, namespace="ns1", collection="col1")
     
-    count = await vector_store.delete(["v1"], collection="col1")
+    # Delete uses ref-count: must pass namespace that matches the vector
+    count = await vector_store.delete(["v1"], namespace="ns1", collection="col1")
     assert count == 1
     
-    res = await vector_store.get_by_id("v1", collection="col1")
+    res = await vector_store.get_by_id("v1", collection="col1", namespace="ns1")
     assert res is None
