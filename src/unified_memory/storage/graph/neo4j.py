@@ -7,9 +7,20 @@ Implements GraphStoreBackend using Neo4j and GDS (Graph Data Science) for PPR.
 from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 import asyncio
+from collections import defaultdict
+
 from neo4j import AsyncGraphDatabase
 
 from unified_memory.storage.base import GraphStoreBackend, GraphNode, GraphEdge
+from unified_memory.core.types import (
+    EntityNode,
+    PassageNode,
+    PageNode,
+    NodeType,
+    SourceLocation,
+    source_locations_to_parallel_arrays,
+    parallel_arrays_to_source_locations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,20 +35,43 @@ class Neo4jGraphStore(GraphStoreBackend):
         auth: Optional[Tuple[str, str]] = ("neo4j", "password"),
     ):
         self.driver = AsyncGraphDatabase.driver(uri, auth=auth)
-        
+
     async def close(self):
         await self.driver.close()
-        
+
+    # ------------------------------------------------------------------
+    # Node operations
+    # ------------------------------------------------------------------
+
     async def create_node(
         self,
         node: GraphNode,
         namespace: str,
     ) -> str:
         query = """
-        MERGE (n:Entity {id: $id, namespace: $namespace})
-        SET n += $properties, n.node_type = $node_type, n.content = $content
-        RETURN n.id
+        MERGE (n:Entity {id: $id})
+        ON CREATE SET
+            n += $properties,
+            n.node_type = $node_type,
+            n.content = $content,
+            n.namespaces = [$namespace],
+            n.source_doc_ids = $source_doc_ids,
+            n.source_chunk_indices = $source_chunk_indices
+        ON MATCH SET
+            n += $properties,
+            n.node_type = $node_type,
+            n.content = $content,
+            n.namespaces = CASE
+                WHEN NOT $namespace IN n.namespaces THEN n.namespaces + $namespace
+                ELSE n.namespaces
+            END,
+            n.source_doc_ids = n.source_doc_ids + $source_doc_ids,
+            n.source_chunk_indices = n.source_chunk_indices + $source_chunk_indices
+        RETURN n.id AS id
         """
+        provenance = source_locations_to_parallel_arrays(
+            getattr(node, "source_locations", [])
+        )
         async with self.driver.session() as session:
             result = await session.run(
                 query,
@@ -45,37 +79,12 @@ class Neo4jGraphStore(GraphStoreBackend):
                 namespace=namespace,
                 node_type=str(node.node_type.value),
                 content=node.content,
-                properties=node.properties
+                properties=node.properties,
+                source_doc_ids=provenance["source_doc_ids"],
+                source_chunk_indices=provenance["source_chunk_indices"],
             )
             record = await result.single()
-            return record["n.id"]
-
-    async def create_edge(
-        self,
-        edge: GraphEdge,
-        namespace: str,
-    ) -> str:
-        # Dynamic relationship type is tricky in Cypher via parameters.
-        # We must sanitize and inject. Assumes edge.relation is safe/validated.
-        rel_type = edge.relation.upper().replace(" ", "_")
-        
-        query = f"""
-        MATCH (s:Entity {{id: $source_id, namespace: $namespace}})
-        MATCH (t:Entity {{id: $target_id, namespace: $namespace}})
-        MERGE (s)-[r:{rel_type}]->(t)
-        SET r += $properties, r.weight = $weight
-        RETURN type(r)
-        """
-        async with self.driver.session() as session:
-            await session.run(
-                query,
-                source_id=edge.source_id,
-                target_id=edge.target_id,
-                namespace=namespace,
-                weight=edge.weight,
-                properties=edge.properties
-            )
-            return f"{edge.source_id}-{rel_type}->{edge.target_id}"
+            return record["id"]
 
     async def create_nodes_batch(
         self,
@@ -84,31 +93,185 @@ class Neo4jGraphStore(GraphStoreBackend):
     ) -> List[str]:
         if not nodes:
             return []
-            
+
         query = """
-        UNWIND $batch as row
-        MERGE (n:Entity {id: row.id, namespace: $namespace})
-        SET n += row.properties, n.node_type = row.node_type, n.content = row.content
-        RETURN n.id
+        UNWIND $batch AS row
+        MERGE (n:Entity {id: row.id})
+        ON CREATE SET
+            n += row.properties,
+            n.node_type = row.node_type,
+            n.content = row.content,
+            n.namespaces = [$namespace],
+            n.source_doc_ids = row.source_doc_ids,
+            n.source_chunk_indices = row.source_chunk_indices
+        ON MATCH SET
+            n += row.properties,
+            n.node_type = row.node_type,
+            n.content = row.content,
+            n.namespaces = CASE
+                WHEN NOT $namespace IN n.namespaces THEN n.namespaces + $namespace
+                ELSE n.namespaces
+            END,
+            n.source_doc_ids = n.source_doc_ids + row.source_doc_ids,
+            n.source_chunk_indices = n.source_chunk_indices + row.source_chunk_indices
+        RETURN n.id AS id
         """
         batch_data = []
         for n in nodes:
-            # Derive label from node_type or use entity_name for EntityNode
             label = str(n.node_type.value)
-            if hasattr(n, 'entity_name') and n.entity_name:
+            if hasattr(n, "entity_name") and n.entity_name:
                 label = n.entity_name
-            
-            batch_data.append({
-                "id": n.id,
-                "node_type": str(n.node_type.value),
-                "content": n.content,
-                "properties": {**n.properties, "label": label}  # Store label in properties if needed
-            })
-        
+            provenance = source_locations_to_parallel_arrays(
+                getattr(n, "source_locations", [])
+            )
+            batch_data.append(
+                {
+                    "id": n.id,
+                    "node_type": str(n.node_type.value),
+                    "content": n.content,
+                    "properties": {**n.properties, "label": label},
+                    "source_doc_ids": provenance["source_doc_ids"],
+                    "source_chunk_indices": provenance["source_chunk_indices"],
+                }
+            )
+
         async with self.driver.session() as session:
             result = await session.run(query, batch=batch_data, namespace=namespace)
             records = await result.data()
-            return [r["n.id"] for r in records]
+            return [r["id"] for r in records]
+
+    async def get_node(self, node_id: str, namespace: str) -> Optional[GraphNode]:
+        nodes = await self.get_nodes_batch([node_id], namespace)
+        return nodes[0] if nodes else None
+
+    async def get_nodes_batch(
+        self,
+        node_ids: List[str],
+        namespace: str,
+    ) -> List[GraphNode]:
+        query = """
+        UNWIND $ids AS node_id
+        MATCH (n:Entity {id: node_id})
+        WHERE $namespace IN n.namespaces
+        RETURN n
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, ids=node_ids, namespace=namespace)
+            records = await result.data()
+
+            nodes = []
+            for r in records:
+                node_data = dict(r["n"])
+                nodes.append(self._node_from_record(node_data, namespace))
+            return nodes
+
+    async def delete_node(self, node_id: str, namespace: str) -> bool:
+        query = """
+        MATCH (n:Entity {id: $id})
+        WHERE $namespace IN n.namespaces
+        WITH n, [x IN n.namespaces WHERE x <> $namespace] AS remaining
+        FOREACH (_ IN CASE WHEN size(remaining) = 0 THEN [1] ELSE [] END |
+            DETACH DELETE n
+        )
+        FOREACH (_ IN CASE WHEN size(remaining) > 0 THEN [1] ELSE [] END |
+            SET n.namespaces = remaining
+        )
+        RETURN size(remaining) = 0 AS deleted
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, id=node_id, namespace=namespace)
+            record = await result.single()
+            return bool(record and record["deleted"])
+
+    # ------------------------------------------------------------------
+    # Edge operations
+    # ------------------------------------------------------------------
+
+    async def create_edge(
+        self,
+        edge: GraphEdge,
+        namespace: str,
+    ) -> str:
+        rel_type = edge.relation
+        provenance = source_locations_to_parallel_arrays(
+            getattr(edge, "source_locations", [])
+        )
+
+        query = f"""
+        MATCH (s:Entity {{id: $source_id}})
+        MATCH (t:Entity {{id: $target_id}})
+        MERGE (s)-[r:{rel_type}]->(t)
+        ON CREATE SET
+            r += $properties,
+            r.id = $edge_id,
+            r.weight = $weight,
+            r.is_bidirectional = $is_bidirectional,
+            r.inverse_relation = $inverse_relation,
+            r.namespaces = [$namespace],
+            r.source_doc_ids = $source_doc_ids,
+            r.source_chunk_indices = $source_chunk_indices
+        ON MATCH SET
+            r += $properties,
+            r.weight = $weight,
+            r.namespaces = CASE
+                WHEN NOT $namespace IN r.namespaces THEN r.namespaces + $namespace
+                ELSE r.namespaces
+            END,
+            r.source_doc_ids = r.source_doc_ids + $source_doc_ids,
+            r.source_chunk_indices = r.source_chunk_indices + $source_chunk_indices
+        RETURN type(r) AS rel_type
+        """
+        async with self.driver.session() as session:
+            await session.run(
+                query,
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                namespace=namespace,
+                edge_id=edge.id,
+                weight=edge.weight,
+                is_bidirectional=edge.is_bidirectional,
+                inverse_relation=edge.inverse_relation,
+                properties=edge.properties,
+                source_doc_ids=provenance["source_doc_ids"],
+                source_chunk_indices=provenance["source_chunk_indices"],
+            )
+
+        # Create inverse edge for bidirectional relations
+        if edge.is_bidirectional and edge.inverse_relation:
+            inv_query = f"""
+            MATCH (s:Entity {{id: $target_id}})
+            MATCH (t:Entity {{id: $source_id}})
+            MERGE (s)-[r:{edge.inverse_relation}]->(t)
+            ON CREATE SET
+                r.id = $edge_id + '_inv',
+                r.weight = $weight,
+                r.is_bidirectional = true,
+                r.namespaces = [$namespace],
+                r.source_doc_ids = $source_doc_ids,
+                r.source_chunk_indices = $source_chunk_indices
+            ON MATCH SET
+                r.weight = $weight,
+                r.namespaces = CASE
+                    WHEN NOT $namespace IN r.namespaces THEN r.namespaces + $namespace
+                    ELSE r.namespaces
+                END,
+                r.source_doc_ids = r.source_doc_ids + $source_doc_ids,
+                r.source_chunk_indices = r.source_chunk_indices + $source_chunk_indices
+            RETURN type(r) AS rel_type
+            """
+            async with self.driver.session() as session:
+                await session.run(
+                    inv_query,
+                    source_id=edge.source_id,
+                    target_id=edge.target_id,
+                    namespace=namespace,
+                    edge_id=edge.id,
+                    weight=edge.weight,
+                    source_doc_ids=provenance["source_doc_ids"],
+                    source_chunk_indices=provenance["source_chunk_indices"],
+                )
+
+        return edge.id
 
     async def create_edges_batch(
         self,
@@ -117,77 +280,331 @@ class Neo4jGraphStore(GraphStoreBackend):
     ) -> List[str]:
         if not edges:
             return []
-            
-        # Group by relation type for batching, as we can't parameterize rel type easily in UNWIND
-        # Or use APOC if available. Assuming standard Cypher for compatibility.
-        
-        from collections import defaultdict
-        edges_by_type = defaultdict(list)
+
+        # NOTE: Cypher relationship types (e.g. `:KNOWS`) are part of the query
+        # syntax and cannot be parameterized per row (you cannot do `r:$type`).
+        # With the current data model (native Neo4j relationship types), batching
+        # across multiple relation types therefore requires grouping by `edge.relation`
+        # and issuing one UNWIND query per type.
+        edges_by_type: Dict[str, List[GraphEdge]] = defaultdict(list)
         for e in edges:
-            rel_type = e.relation.upper().replace(" ", "_")
-            edges_by_type[rel_type].append(e)
-            
-        created_ids = []
-        
+            edges_by_type[e.relation].append(e)
+
+        created_ids: List[str] = []
+
         async with self.driver.session() as session:
             for rel_type, type_edges in edges_by_type.items():
                 query = f"""
-                UNWIND $batch as row
-                MATCH (s:Entity {{id: row.source, namespace: $namespace}})
-                MATCH (t:Entity {{id: row.target, namespace: $namespace}})
+                UNWIND $batch AS row
+                MATCH (s:Entity {{id: row.source}})
+                MATCH (t:Entity {{id: row.target}})
                 MERGE (s)-[r:{rel_type}]->(t)
-                SET r += row.properties, r.weight = row.weight
-                RETURN s.id, t.id
+                ON CREATE SET
+                    r += row.properties,
+                    r.id = row.edge_id,
+                    r.weight = row.weight,
+                    r.is_bidirectional = row.is_bidirectional,
+                    r.inverse_relation = row.inverse_relation,
+                    r.namespaces = [$namespace],
+                    r.source_doc_ids = row.source_doc_ids,
+                    r.source_chunk_indices = row.source_chunk_indices
+                ON MATCH SET
+                    r += row.properties,
+                    r.weight = row.weight,
+                    r.namespaces = CASE
+                        WHEN NOT $namespace IN r.namespaces THEN r.namespaces + $namespace
+                        ELSE r.namespaces
+                    END,
+                    r.source_doc_ids = r.source_doc_ids + row.source_doc_ids,
+                    r.source_chunk_indices = r.source_chunk_indices + row.source_chunk_indices
+                RETURN s.id AS source_id, t.id AS target_id
                 """
-                
-                batch_data = [
-                    {
-                        "source": e.source,
-                        "target": e.target,
-                        "weight": e.weight,
-                        "properties": e.properties
-                    }
-                    for e in type_edges
-                ]
-                
+
+                batch_data = []
+                for e in type_edges:
+                    provenance = source_locations_to_parallel_arrays(
+                        getattr(e, "source_locations", [])
+                    )
+                    batch_data.append(
+                        {
+                            "source": e.source_id,
+                            "target": e.target_id,
+                            "edge_id": e.id,
+                            "weight": e.weight,
+                            "is_bidirectional": e.is_bidirectional,
+                            "inverse_relation": e.inverse_relation,
+                            "properties": e.properties,
+                            "source_doc_ids": provenance["source_doc_ids"],
+                            "source_chunk_indices": provenance["source_chunk_indices"],
+                        }
+                    )
+
                 await session.run(query, batch=batch_data, namespace=namespace)
-                # Just mock return IDs for efficiency
-                created_ids.extend([f"{e.source}-{rel_type}->{e.target}" for e in type_edges])
-                
+                created_ids.extend(e.id for e in type_edges)
+
         return created_ids
 
-    async def get_nodes_batch(
+    async def delete_edges(
+        self,
+        source_id: Optional[str] = None,
+        target_id: Optional[str] = None,
+        namespace: Optional[str] = None,
+    ) -> int:
+        where_clauses = []
+        params: Dict[str, Any] = {}
+
+        if source_id:
+            where_clauses.append("s.id = $source_id")
+            params["source_id"] = source_id
+        if target_id:
+            where_clauses.append("t.id = $target_id")
+            params["target_id"] = target_id
+        if namespace:
+            where_clauses.append("$namespace IN r.namespaces")
+            params["namespace"] = namespace
+
+        where_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        query = f"""
+        MATCH (s:Entity)-[r]->(t:Entity)
+        {where_str}
+        WITH r, [x IN r.namespaces WHERE x <> $namespace] AS remaining
+        FOREACH (_ IN CASE WHEN size(remaining) = 0 THEN [1] ELSE [] END |
+            DELETE r
+        )
+        FOREACH (_ IN CASE WHEN size(remaining) > 0 THEN [1] ELSE [] END |
+            SET r.namespaces = remaining
+        )
+        RETURN count(r) AS affected
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, **params)
+            record = await result.single()
+            return int(record["affected"]) if record else 0
+
+    # ------------------------------------------------------------------
+    # Namespace operations (split)
+    # ------------------------------------------------------------------
+
+    async def add_namespace_to_node(
+        self,
+        node_id: str,
+        namespace: str,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        query = """
+        MATCH (n:Entity {id: $id})
+        SET n.namespaces = CASE
+            WHEN NOT $namespace IN n.namespaces THEN n.namespaces + $namespace
+            ELSE n.namespaces
+        END,
+        n.source_doc_ids = CASE
+            WHEN $document_id IS NOT NULL AND NOT $document_id IN n.source_doc_ids THEN n.source_doc_ids + $document_id
+            ELSE n.source_doc_ids
+        END
+        RETURN n.id AS id
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, id=node_id, namespace=namespace, document_id=document_id)
+            record = await result.single()
+            return record is not None
+
+    async def add_namespace_to_edge(
+        self,
+        edge_id: str,
+        namespace: str,
+        document_id: Optional[str] = None,
+    ) -> bool:
+        query = """
+        MATCH ()-[r]->()
+        WHERE r.id = $edge_id
+        SET r.namespaces = CASE
+            WHEN NOT $namespace IN r.namespaces THEN r.namespaces + $namespace
+            ELSE r.namespaces
+        END,
+        r.source_doc_ids = CASE
+            WHEN $document_id IS NOT NULL AND NOT $document_id IN r.source_doc_ids THEN r.source_doc_ids + $document_id
+            ELSE r.source_doc_ids
+        END
+        RETURN r.id AS id
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, edge_id=edge_id, namespace=namespace, document_id=document_id)
+            record = await result.single()
+            return record is not None
+
+    async def add_namespace(self, id: str, namespace: str, document_id: Optional[str] = None) -> bool:
+        if await self.add_namespace_to_node(id, namespace, document_id):
+            return True
+        return await self.add_namespace_to_edge(id, namespace, document_id)
+
+    async def remove_namespace_from_node(
+        self,
+        node_id: str,
+        namespace: str,
+    ) -> Tuple[bool, bool]:
+        query = """
+        MATCH (n:Entity {id: $id})
+        WHERE $namespace IN n.namespaces
+        WITH n, [x IN n.namespaces WHERE x <> $namespace] AS remaining
+        FOREACH (_ IN CASE WHEN size(remaining) = 0 THEN [1] ELSE [] END |
+            DETACH DELETE n
+        )
+        FOREACH (_ IN CASE WHEN size(remaining) > 0 THEN [1] ELSE [] END |
+            SET n.namespaces = remaining
+        )
+        RETURN size(remaining) = 0 AS was_last
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, id=node_id, namespace=namespace)
+            record = await result.single()
+            if record is None:
+                return False, False
+            return True, bool(record["was_last"])
+
+    async def remove_namespace_from_edge(
+        self,
+        edge_id: str,
+        namespace: str,
+    ) -> Tuple[bool, bool]:
+        query = """
+        MATCH ()-[r]->()
+        WHERE r.id = $edge_id AND $namespace IN r.namespaces
+        WITH r, [x IN r.namespaces WHERE x <> $namespace] AS remaining
+        FOREACH (_ IN CASE WHEN size(remaining) = 0 THEN [1] ELSE [] END |
+            DELETE r
+        )
+        FOREACH (_ IN CASE WHEN size(remaining) > 0 THEN [1] ELSE [] END |
+            SET r.namespaces = remaining
+        )
+        RETURN size(remaining) = 0 AS was_last
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, edge_id=edge_id, namespace=namespace)
+            record = await result.single()
+            if record is None:
+                return False, False
+            return True, bool(record["was_last"])
+
+    async def remove_namespace(
+        self, id: str, namespace: str
+    ) -> Tuple[bool, bool]:
+        success, was_last = await self.remove_namespace_from_node(id, namespace)
+        if success:
+            return success, was_last
+        return await self.remove_namespace_from_edge(id, namespace)
+
+    # ------------------------------------------------------------------
+    # Query operations
+    # ------------------------------------------------------------------
+
+    async def get_neighbors(
+        self,
+        node_id: str,
+        namespace: str,
+        direction: str = "both",
+        edge_types: Optional[List[str]] = None,
+    ) -> List[GraphNode]:
+        if direction == "out":
+            pattern = "(n:Entity {id: $id})-[r]->(m:Entity)"
+        elif direction == "in":
+            pattern = "(m:Entity)-[r]->(n:Entity {id: $id})"
+        else:
+            pattern = "(n:Entity {id: $id})-[r]-(m:Entity)"
+
+        where_parts = ["$namespace IN r.namespaces", "$namespace IN m.namespaces"]
+        params: Dict[str, Any] = {"id": node_id, "namespace": namespace}
+
+        if edge_types:
+            where_parts.append("type(r) IN $edge_types")
+            params["edge_types"] = edge_types
+
+        where_str = " AND ".join(where_parts)
+
+        query = f"""
+        MATCH {pattern}
+        WHERE {where_str}
+        RETURN DISTINCT m
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, **params)
+            records = await result.data()
+            return [self._node_from_record(dict(r["m"]), namespace) for r in records]
+
+    async def query_nodes(
+        self,
+        filters: Dict[str, Any],
+        namespace: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        where_clauses = []
+        params: Dict[str, Any] = {"limit": limit}
+
+        if namespace:
+            where_clauses.append("$namespace IN n.namespaces")
+            params["namespace"] = namespace
+
+        for idx, (k, v) in enumerate(filters.items()):
+            param_name = f"p{idx}"
+            where_clauses.append(f"n.{k} = ${param_name}")
+            params[param_name] = v
+
+        where_str = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        query = f"""
+        MATCH (n:Entity)
+        {where_str}
+        RETURN n
+        LIMIT $limit
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, **params)
+            records = await result.data()
+            return [dict(r["n"]) for r in records]
+
+    async def get_subgraph(
         self,
         node_ids: List[str],
         namespace: str,
-    ) -> List[GraphNode]:
+        max_hops: int = 2,
+    ) -> Tuple[List[GraphNode], List[GraphEdge]]:
+        if not node_ids:
+            return [], []
+
         query = """
-        UNWIND $ids as node_id
-        MATCH (n:Entity {id: node_id, namespace: $namespace})
-        RETURN n
+        MATCH (n:Entity)
+        WHERE n.id IN $seed_ids AND $namespace IN n.namespaces
+        WITH collect(n) AS seeds
+        CALL apoc.path.subgraphNodes(seeds, {maxLevel: $max_hops}) YIELD node
+        WITH collect(DISTINCT node) AS nodes
+        MATCH (s:Entity)-[r]->(t:Entity)
+        WHERE s IN nodes AND t IN nodes AND $namespace IN r.namespaces
+        RETURN nodes, collect(DISTINCT r) AS rels
         """
         async with self.driver.session() as session:
-            result = await session.run(query, ids=node_ids, namespace=namespace)
-            records = await result.data()
-            
+            result = await session.run(
+                query,
+                seed_ids=node_ids,
+                namespace=namespace,
+                max_hops=max_hops,
+            )
+            record = await result.single()
+            if not record:
+                return [], []
+
             nodes = []
-            for r in records:
-                n = r["n"]
-                props = dict(n)
-                # Extract reserved fields
-                nid = props.pop("id")
-                # Handle label fallback
-                nlabel = props.pop("node_type", "Entity")
-                # Remove internal namespace prop
-                props.pop("namespace", None)
-                
-                nodes.append(GraphNode(
-                    id=nid,
-                    label=nlabel,
-                    properties=props,
-                    content=props.pop("content", "")
-                ))
-            return nodes
+            for n in record["nodes"]:
+                nodes.append(self._node_from_record(dict(n), namespace))
+
+            edges = []
+            for r in record["rels"]:
+                edges.append(self._edge_from_record(r, namespace))
+
+            return nodes, edges
+
+    # ------------------------------------------------------------------
+    # Personalized PageRank
+    # ------------------------------------------------------------------
 
     async def personalized_pagerank(
         self,
@@ -197,23 +614,11 @@ class Neo4jGraphStore(GraphStoreBackend):
         max_iterations: int = 100,
         top_k: int = 20,
     ) -> List[Tuple[str, float]]:
-        """
-        Run PPR using GDS.
-        """
-        # 1. Project sub-graph for namespace
-        graph_name = f"graph_{namespace}"
-        
-        # Check if graph exists or project it
-        # Simple ephemeral projection
-        
-        # NOTE: GDS projection is heavy. In production, maintain persistent projections or use algorithm on anonymous graph.
-        # Anonymous graph example:
-        
         query = """
         CALL gds.pageRank.stream(
           {
-            nodeQuery: 'MATCH (n:Entity {namespace: $namespace}) RETURN id(n) as id',
-            relationshipQuery: 'MATCH (n:Entity {namespace: $namespace})-[r]->(m:Entity {namespace: $namespace}) RETURN id(n) as source, id(m) as target, r.weight as weight',
+            nodeQuery: 'MATCH (n:Entity) WHERE $namespace IN n.namespaces RETURN id(n) as id',
+            relationshipQuery: 'MATCH (n:Entity)-[r]->(m:Entity) WHERE $namespace IN r.namespaces RETURN id(n) as source, id(m) as target, r.weight as weight',
             relationshipWeightProperty: 'weight',
             dampingFactor: $damping,
             maxIterations: $iterations,
@@ -221,64 +626,100 @@ class Neo4jGraphStore(GraphStoreBackend):
           }
         )
         YIELD nodeId, score
-        RETURN gds.util.asNode(nodeId).id as id, score
+        RETURN gds.util.asNode(nodeId).id AS id, score
         ORDER BY score DESC
         LIMIT $top_k
         """
-        
-        # Transform seed_nodes (string IDs) to internal Node IDs for GDS?
-        # GDS sourceNodes can take internal IDs.
-        # We need to lookup internal IDs first.
-        
+
         async with self.driver.session() as session:
-            # 1. Get internal IDs for seeds
-            # Use elementalId() or stay with internal id() for now but fix the call
-            id_query = "MATCH (n:Entity {namespace: $namespace}) WHERE n.id IN $seeds RETURN id(n) as internal_id"
-            result = await session.run(id_query, seeds=seed_nodes, namespace=namespace)
+            id_query = """
+            MATCH (n:Entity)
+            WHERE n.id IN $seeds AND $namespace IN n.namespaces
+            RETURN id(n) AS internal_id
+            """
+            result = await session.run(
+                id_query, seeds=seed_nodes, namespace=namespace
+            )
             internal_ids = [record["internal_id"] async for record in result]
-            
+
             if not internal_ids:
                 return []
-                
-            # 2. Run PPR
+
             result = await session.run(
                 query,
                 namespace=namespace,
                 damping=damping,
                 iterations=max_iterations,
-                source_nodes=internal_ids, # Pass list of integers
-                top_k=top_k
+                source_nodes=internal_ids,
+                top_k=top_k,
             )
-            
+
             ppr_results = []
             async for record in result:
                 ppr_results.append((record["id"], record["score"]))
-                
+
             return ppr_results
 
-    # Implement other strict abstract methods with stubs or logic as needed
-    async def get_node(self, node_id: str, namespace: str) -> Optional[GraphNode]:
-        nodes = await self.get_nodes_batch([node_id], namespace)
-        return nodes[0] if nodes else None
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    async def get_neighbors(
-        self,
-        node_id: str,
-        namespace: str,
-        direction: str = "both",
-        edge_types: Optional[List[str]] = None,
-    ) -> List[GraphNode]:
-        # Implementation omitted for brevity in this step, focusing on PPR
-        return []
+    @staticmethod
+    def _node_from_record(props: Dict[str, Any], namespace: str) -> GraphNode:
+        """Build a GraphNode from a Neo4j record dict."""
+        nid = props.pop("id", "")
+        node_type_str = props.pop("node_type", "entity")
+        content = props.pop("content", "")
+        props.pop("namespaces", None)
 
-    async def query_nodes(self, filters, namespace=None, limit=100) -> List[Dict[str, Any]]:
-        return []
+        src_doc_ids = props.pop("source_doc_ids", [])
+        src_chunk_indices = props.pop("source_chunk_indices", [])
+        source_locations = parallel_arrays_to_source_locations(
+            src_doc_ids, src_chunk_indices
+        )
 
-    async def delete_node(self, node_id, namespace) -> bool:
-        return True
+        try:
+            node_type = NodeType(node_type_str)
+        except ValueError:
+            node_type = NodeType.ENTITY
 
-    async def delete_edges(self, source_id=None, target_id=None, namespace=None) -> int:
-        return 0
+        return EntityNode(
+            id=nid,
+            node_type=node_type,
+            content=content,
+            source_locations=source_locations,
+            namespace=namespace,
+            properties=props,
+            entity_name=props.pop("label", nid),
+        )
 
-    async def get_subgraph(self, node_ids, namespace, max_hops=2) -> Tuple[List[GraphNode], List[GraphEdge]]:
-        return [], []
+    @staticmethod
+    def _edge_from_record(rel: Any, namespace: str) -> GraphEdge:
+        """Build a GraphEdge from a Neo4j relationship record."""
+        props = dict(rel)
+        start_id = rel.start_node["id"]
+        end_id = rel.end_node["id"]
+        rid = props.pop("id", None)
+        weight = props.pop("weight", 1.0)
+        is_bidir = props.pop("is_bidirectional", False)
+        inv_rel = props.pop("inverse_relation", None)
+        props.pop("namespaces", None)
+
+        src_doc_ids = props.pop("source_doc_ids", [])
+        src_chunk_indices = props.pop("source_chunk_indices", [])
+        source_locations = parallel_arrays_to_source_locations(
+            src_doc_ids, src_chunk_indices
+        )
+
+        return GraphEdge(
+            source_id=start_id,
+            target_id=end_id,
+            relation=rel.type,
+            id=rid,
+            weight=weight,
+            is_bidirectional=is_bidir,
+            inverse_relation=inv_rel,
+            source_locations=source_locations,
+            namespace=namespace,
+            properties=props,
+        )
