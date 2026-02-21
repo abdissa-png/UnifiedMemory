@@ -79,9 +79,29 @@ class DocumentParser(ABC):
         Example: ["text/plain", "text/markdown"] for text parser.
         """
         raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def default_source_type(self) -> SourceType:
+        """
+        Default SourceType for documents handled by this parser.
+
+        Examples:
+            - TextParser -> SourceType.TEXT_BLOCK
+            - PDFParser  -> SourceType.FULL_PAGE
+        """
+        raise NotImplementedError
     
-    def can_parse(self, path: Path) -> bool:
-        """Check if this parser can handle the given file."""
+    def can_parse(self, path: Path, mime_type: Optional[str] = None) -> bool:
+        """
+        Check if this parser can handle the given file.
+        
+        Args:
+            path: Path to the file
+            mime_type: Optional MIME type for more accurate matching
+        """
+        if mime_type and mime_type.lower() in self.supported_mime_types:
+            return True
         return path.suffix.lower() in self.supported_extensions
     
     @abstractmethod
@@ -125,7 +145,7 @@ class DocumentParser(ABC):
         doc_id = document_id or str(uuid.uuid4())
         source_ref = SourceReference(
             source_id=doc_id,
-            source_type=SourceType.TEXT_BLOCK,
+            source_type=self.default_source_type,
         )
         
         with open(path, "rb") as f:
