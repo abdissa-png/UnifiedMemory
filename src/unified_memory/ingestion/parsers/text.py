@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 from typing import Any, BinaryIO, List
 
-from unified_memory.core.types import PageContent, SourceReference
+from unified_memory.core.types import PageContent, SourceReference, SourceType
 from unified_memory.ingestion.parsers.base import DocumentParser, ParsedDocument
 
 
@@ -30,6 +30,11 @@ class TextParser(DocumentParser):
             "text/x-markdown",
             "text/x-rst",
         ]
+
+    @property
+    def default_source_type(self) -> SourceType:
+        """Text documents are modeled as TEXT_BLOCK sources."""
+        return SourceType.TEXT_BLOCK
     
     async def parse(
         self,
