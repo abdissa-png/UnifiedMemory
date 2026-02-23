@@ -76,7 +76,7 @@ class Chunker(ABC):
         self,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
     ) -> List[Chunk]:
         """
         Split a parsed document into chunks.
@@ -97,21 +97,22 @@ class Chunker(ABC):
         document: ParsedDocument,
         chunk_index: int,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
         page_number: Optional[int] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Chunk:
         """
         Helper to create a Chunk with proper metadata.
         """
-        from unified_memory.core.types import compute_content_hash
-        
-        # Canonical content hash
-        content_hash = compute_content_hash(text, embedding_model)
+        from unified_memory.core.types import compute_content_hash, Modality
+
+        # Canonical content hash (TEXT modality by default for document chunks)
+        content_hash = compute_content_hash(text, tenant_id, Modality.TEXT)
         
         metadata = {
             "chunker": self.name,
             "namespace": namespace,
+            "document_id": document.document_id,
         }
         
         if document.title and self.config.include_section_headers:

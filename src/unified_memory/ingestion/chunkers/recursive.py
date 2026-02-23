@@ -37,7 +37,7 @@ class RecursiveChunker(Chunker):
         self,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
     ) -> List[Chunk]:
         """
         Split document recursively.
@@ -73,7 +73,7 @@ class RecursiveChunker(Chunker):
                     document=document,
                     chunk_index=chunk_idx,
                     namespace=namespace,
-                    embedding_model=embedding_model,
+                    tenant_id=tenant_id,
                     page_number=page.page_number
                 )
                 chunks.append(chunk)
@@ -133,17 +133,25 @@ class RecursiveChunker(Chunker):
                 continue
                 
             # If adding would exceed size, flush
-            if current_len + split_len + len(separator) > chunk_size:
+            if current_len + split_len + (len(separator) if current_chunk else 0) > chunk_size:
                 if current_chunk:
                     final_chunks.append(separator.join(current_chunk))
                     
-                    # Handle overlap (simplified)
-                    # For strict overlap we'd need more complex logic here
-                    current_chunk = []
-                    current_len = 0
+                    # Handle overlap: Keep some elements from current_chunk for next
+                    # We take as many elements as fit within chunk_overlap
+                    overlap_chunk = []
+                    overlap_len = 0
+                    for s in reversed(current_chunk):
+                        if overlap_len + len(s) + (len(separator) if overlap_chunk else 0) <= chunk_overlap:
+                            overlap_chunk.insert(0, s)
+                            overlap_len += len(s) + (len(separator) if overlap_chunk > [s] else 0)
+                        else:
+                            break
+                    current_chunk = overlap_chunk
+                    current_len = overlap_len
             
             current_chunk.append(split)
-            current_len += split_len + len(separator)
+            current_len += split_len + (len(separator) if len(current_chunk) > 1 else 0)
             
         # Flush remaining
         if current_chunk:

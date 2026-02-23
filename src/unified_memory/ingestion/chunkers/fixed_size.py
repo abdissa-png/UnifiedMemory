@@ -30,7 +30,7 @@ class FixedSizeChunker(Chunker):
         self,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
     ) -> List[Chunk]:
         """
         Split document into fixed-size chunks.
@@ -38,15 +38,22 @@ class FixedSizeChunker(Chunker):
         all_chunks = []
         chunk_index_offset = 0
         
+        # Guard against infinite loops
+        if self.config.chunk_overlap >= self.config.chunk_size:
+            raise ValueError(
+                f"Chunk overlap ({self.config.chunk_overlap}) must be less than "
+                f"chunk size ({self.config.chunk_size}) to avoid infinite loops."
+            )
+        
         for page in document.pages:
             text = page.full_text
             if not text.strip():
                 continue
                 
             if self.config.respect_sentence_boundaries:
-                page_chunks = self._chunk_by_sentences(text, document, namespace, embedding_model, page.page_number, chunk_index_offset)
+                page_chunks = self._chunk_by_sentences(text, document, namespace, tenant_id, page.page_number, chunk_index_offset)
             else:
-                page_chunks = self._chunk_by_characters(text, document, namespace, embedding_model, page.page_number, chunk_index_offset)
+                page_chunks = self._chunk_by_characters(text, document, namespace, tenant_id, page.page_number, chunk_index_offset)
             
             all_chunks.extend(page_chunks)
             chunk_index_offset += len(page_chunks)
@@ -58,7 +65,7 @@ class FixedSizeChunker(Chunker):
         text: str,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
         page_number: Optional[int] = None,
         chunk_index_offset: int = 0
     ) -> List[Chunk]:
@@ -80,11 +87,15 @@ class FixedSizeChunker(Chunker):
                     document=document,
                     chunk_index=chunk_index,
                     namespace=namespace,
-                    embedding_model=embedding_model,
+                    tenant_id=tenant_id,
                     page_number=page_number
                 ))
                 chunk_index += 1
             
+            # If we've reached or passed the end, we're done
+            if end >= len(text):
+                break
+                
             # Move start with overlap
             start = end - overlap
             if start <= (end - chunk_size):
@@ -98,7 +109,7 @@ class FixedSizeChunker(Chunker):
         text: str,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
         page_number: Optional[int] = None,
         chunk_index_offset: int = 0
     ) -> List[Chunk]:
@@ -129,7 +140,7 @@ class FixedSizeChunker(Chunker):
                         document=document,
                         chunk_index=chunk_index,
                         namespace=namespace,
-                        embedding_model=embedding_model,
+                        tenant_id=tenant_id,
                         page_number=page_number
                     ))
                     chunk_index += 1
@@ -145,7 +156,7 @@ class FixedSizeChunker(Chunker):
                             document=document,
                             chunk_index=chunk_index,
                             namespace=namespace,
-                            embedding_model=embedding_model,
+                            tenant_id=tenant_id,
                             page_number=page_number
                         ))
                         chunk_index += 1
@@ -161,7 +172,7 @@ class FixedSizeChunker(Chunker):
                         document=document,
                         chunk_index=chunk_index,
                         namespace=namespace,
-                        embedding_model=embedding_model,
+                        tenant_id=tenant_id,
                         page_number=page_number
                     ))
                     chunk_index += 1
@@ -191,7 +202,7 @@ class FixedSizeChunker(Chunker):
                 document=document,
                 chunk_index=chunk_index,
                 namespace=namespace,
-                embedding_model=embedding_model,
+                tenant_id=tenant_id,
                 page_number=page_number
             ))
         
