@@ -45,7 +45,7 @@ class SemanticChunker(Chunker):
         self,
         document: ParsedDocument,
         namespace: str,
-        embedding_model: str,
+        tenant_id: str,
     ) -> List[Chunk]:
         """
         Split document into semantic chunks across pages.
@@ -89,7 +89,7 @@ class SemanticChunker(Chunker):
                 document=document,
                 chunk_index=i,
                 namespace=namespace,
-                embedding_model=embedding_model,
+                tenant_id=tenant_id,
                 page_number=page_number,
                 extra_metadata={
                     "start_char": start,
