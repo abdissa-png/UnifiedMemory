@@ -4,7 +4,7 @@ Sparse Retrieval Implementation.
 Wrapper around BM25 for keyword search.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import logging
 
 from unified_memory.core.types import RetrievalResult
@@ -38,11 +38,13 @@ class SparseRetriever:
     async def retrieve(
         self,
         query: str,
-        namespace: str,
+        namespaces: Union[str, List[str]],
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalResult]:
         """Retrieve documents using sparse matching."""
+        if isinstance(namespaces, str):
+            namespaces = [namespaces]
         # MVP: Return empty list until full indexing is implemented
         # or implement simple in-memory BM25 if needed for testing.
         return []
@@ -51,6 +53,7 @@ class SparseRetriever:
         self,
         doc_ids: List[str],
         namespace: str,
+        document_id: Optional[str] = None,
     ) -> int:
         """Delete documents from sparse index."""
         return 0
