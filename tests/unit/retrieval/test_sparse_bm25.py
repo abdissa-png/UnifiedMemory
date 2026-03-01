@@ -52,3 +52,69 @@ async def test_bm25_empty_and_unknown_namespace():
     # Retrieve from empty
     results = await retriever.retrieve("query", "created_but_empty")
     assert results == []
+
+@pytest.mark.asyncio
+async def test_bm25_namespace_isolation():
+    retriever = BM25SparseRetriever()
+    
+    # Index "fox" in ns1
+    await retriever.index([{"id": "doc1", "content": "The quick brown fox"}], "ns1")
+    # Index "cat" in ns2
+    await retriever.index([{"id": "doc2", "content": "The quick black cat"}], "ns2")
+    
+    # Query ns1 for "cat" -> should be empty
+    results = await retriever.retrieve("cat", "ns1")
+    assert results == []
+    
+    # Query ns2 for "fox" -> should be empty
+    results = await retriever.retrieve("fox", "ns2")
+    assert results == []
+    
+    # Query ns1 for "fox" -> should have 1
+    results = await retriever.retrieve("fox", "ns1")
+    assert len(results) == 1
+    assert results[0].id == "doc1"
+
+@pytest.mark.asyncio
+async def test_bm25_unicode_content():
+    retriever = BM25SparseRetriever()
+    namespace = "unicode_ns"
+    
+    # Japanese and Emoji
+    documents = [
+        {"id": "jp1", "content": "こんにちは、世界！", "metadata": {}},
+        {"id": "emoji1", "content": "The robot 🤖 is happy 😃.", "metadata": {}},
+    ]
+    
+    await retriever.index(documents, namespace)
+    
+    # Query Japanese
+    results = await retriever.retrieve("こんにちは", namespace)
+    assert len(results) == 1
+    assert results[0].id == "jp1"
+    
+    # Query Emoji
+    results = await retriever.retrieve("🤖", namespace)
+    assert len(results) == 1
+    assert results[0].id == "emoji1"
+
+@pytest.mark.asyncio
+async def test_bm25_incremental_indexing():
+    retriever = BM25SparseRetriever()
+    namespace = "inc_ns"
+    
+    # First batch
+    await retriever.index([{"id": "doc1", "content": "The quick brown fox"}], namespace)
+    results = await retriever.retrieve("fox", namespace)
+    assert len(results) == 1
+    
+    # Second batch (should append, not overwrite?)
+    # Design choice: BM25 typically appends/re-indexes.
+    # Our implementation uses a dictionary internally, so it appends by id.
+    await retriever.index([{"id": "doc2", "content": "The black cat"}], namespace)
+    
+    # Verify BOTH are searchable
+    results1 = await retriever.retrieve("fox", namespace)
+    assert len(results1) == 1
+    results2 = await retriever.retrieve("cat", namespace)
+    assert len(results2) == 1
