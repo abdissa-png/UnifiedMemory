@@ -113,10 +113,14 @@ def reciprocal_rank_fusion(
 def linear_fusion(
     results: List[RetrievalResult],
     weights: Dict[str, float],
+    normalize_first: bool = False,
 ) -> List[RetrievalResult]:
     """
     Weighted linear fusion. Assumes scores are normalized.
     """
+    if normalize_first:
+        results = normalize_scores(results)
+
     fused_scores: Dict[str, float] = {}
     id_to_result: Dict[str, RetrievalResult] = {}
     
