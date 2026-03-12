@@ -1,0 +1,105 @@
+#
+# Example application configuration for Unified Memory System.
+#
+# You can run with:
+#   ctx = SystemContext.from_config_file("config/app.example.yaml")
+#
+
+infra:
+  # Key–value store backend: "memory" or "redis"
+  kv_store: "redis"
+  redis_url: "${REDIS_URL}"
+
+  # Vector store backend: "memory" or "qdrant"
+  vector_store: "qdrant"
+  qdrant_url: "${QDRANT_URL}"
+  qdrant_api_key: "${QDRANT_API_KEY}"
+
+  # Graph store backend: "networkx" or "neo4j"
+  graph_store: "neo4j"
+  neo4j_uri: "${NEO4J_URI}"
+  neo4j_auth_user: "${NEO4J_AUTH_USER}"
+  neo4j_auth_password: "${NEO4J_AUTH_PASSWORD}"
+
+  # Sparse retriever backend: "bm25" (in-memory) or "elasticsearch"
+  sparse_retriever: "elasticsearch"
+  elasticsearch_url: "${ELASTICSEARCH_URL}"
+  elasticsearch_index: "${ELASTICSEARCH_INDEX}"
+  elasticsearch_api_key: "${ELASTICSEARCH_API_KEY}"
+
+embedding_providers:
+  # Mock provider used in tests and local dev; key is an arbitrary ID.
+  "mock:mock-model":
+    provider: "mock"
+    model: "mock-model"
+    dimension: 128
+    modality: "text"
+
+  # Example OpenAI text embedding provider.
+  "openai:text-embedding-3-small":
+    provider: "openai"
+    model: "text-embedding-3-small"
+    dimension: 1536
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "${OPENAI_BASE_URL}"
+    modality: "text"
+
+  # Example OpenAI vision/multimodal embedding provider.
+  "openai:clip-vit-base-patch32":
+    provider: "openai"
+    model: "clip-vit-base-patch32"
+    dimension: 512
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "${OPENAI_BASE_URL}"
+    modality: "vision"
+
+llm_providers:
+  # Example OpenAI chat model for extraction and QA.
+  "openai:gpt-4o-mini":
+    provider: "openai"
+    model: "gpt-4o-mini"
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "${OPENAI_BASE_URL}"
+    supports_images: true
+
+extractors:
+  # Default mock extractor (no external calls).
+  "mock":
+    type: "mock"
+
+  # LLM-based extractor using the above LLM provider.
+  "llm-default":
+    type: "llm"
+    llm_provider: "openai:gpt-4o-mini"
+
+rerankers:
+  # Local BGE reranker via sentence-transformers.
+  "bge-local":
+    type: "bge"
+    model: "${BGE_RERANKER_MODEL}"
+
+  # Cohere cloud reranker.
+  "cohere-default":
+    type: "cohere"
+    model: "${COHERE_RERANKER_MODEL}"
+    api_key: "${COHERE_API_KEY}"
+
+defaults:
+  # Which retrieval paths are enabled by default.
+  retrieval_paths:
+    - "dense"
+    - "sparse"
+    - "graph"
+
+  # When true, ingestion will try to reuse existing embeddings instead of
+  # recomputing them where possible. Setting this to true *and* disabling
+  # embeddings entirely is NOT supported (see validate_config_compatibility).
+  skip_embedding: false
+
+  # When true, ingestion will index page images using a vision-capable
+  # embedding provider (one of the embedding_providers above must have
+  # modality "vision" / "image" / "shared").
+  enable_visual_indexing: true
+
+config_version: 1
+
