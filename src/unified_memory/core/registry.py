@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 from unified_memory.core.interfaces import EmbeddingProvider
 from unified_memory.ingestion.extractors.base import Extractor
+from unified_memory.ingestion.parsers.base import DocumentParser
+from unified_memory.ingestion.parsers.registry import (
+    get_parser_registry,
+    ParserRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,7 @@ class ProviderRegistry:
         self._vision_embedding_providers: Dict[str, EmbeddingProvider] = {}
         self._extractors: Dict[str, Extractor] = {}
         self._rerankers: Dict[str, Any] = {}
+        self._parser_registry: ParserRegistry = get_parser_registry()
 
     # ------------------------------------------------------------------
     # Text embedding providers
@@ -128,3 +135,21 @@ class ProviderRegistry:
 
     def get_reranker(self, key: str) -> Optional[Any]:
         return self._rerankers.get(key)
+
+    # ------------------------------------------------------------------
+    # Parsers (delegate to global ParserRegistry)
+    # ------------------------------------------------------------------
+
+    def get_parser_registry(self) -> ParserRegistry:
+        """Expose the shared ParserRegistry instance."""
+        return self._parser_registry
+
+    def register_parser(self, parser: DocumentParser) -> None:
+        """Register a parser in the shared ParserRegistry."""
+        self._parser_registry.register(parser)
+
+    def get_parser_for_file(
+        self, path: Path, mime_type: Optional[str] = None
+    ) -> Optional[DocumentParser]:
+        """Lookup a parser by file path and optional MIME type."""
+        return self._parser_registry.get_parser_for_file(path, mime_type)
