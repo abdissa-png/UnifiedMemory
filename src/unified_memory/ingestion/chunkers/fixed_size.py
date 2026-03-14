@@ -31,18 +31,21 @@ class FixedSizeChunker(Chunker):
         document: ParsedDocument,
         namespace: str,
         tenant_id: str,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """
         Split document into fixed-size chunks.
         """
+        cfg = config or ChunkingConfig()
+
         all_chunks = []
         chunk_index_offset = 0
         
         # Guard against infinite loops
-        if self.config.chunk_overlap >= self.config.chunk_size:
+        if cfg.chunk_overlap >= cfg.chunk_size:
             raise ValueError(
-                f"Chunk overlap ({self.config.chunk_overlap}) must be less than "
-                f"chunk size ({self.config.chunk_size}) to avoid infinite loops."
+                f"Chunk overlap ({cfg.chunk_overlap}) must be less than "
+                f"chunk size ({cfg.chunk_size}) to avoid infinite loops."
             )
         
         for page in document.pages:
@@ -50,10 +53,26 @@ class FixedSizeChunker(Chunker):
             if not text.strip():
                 continue
                 
-            if self.config.respect_sentence_boundaries:
-                page_chunks = self._chunk_by_sentences(text, document, namespace, tenant_id, page.page_number, chunk_index_offset)
+            if cfg.respect_sentence_boundaries:
+                page_chunks = self._chunk_by_sentences(
+                    text,
+                    document,
+                    namespace,
+                    tenant_id,
+                    page.page_number,
+                    chunk_index_offset,
+                    cfg,
+                )
             else:
-                page_chunks = self._chunk_by_characters(text, document, namespace, tenant_id, page.page_number, chunk_index_offset)
+                page_chunks = self._chunk_by_characters(
+                    text,
+                    document,
+                    namespace,
+                    tenant_id,
+                    page.page_number,
+                    chunk_index_offset,
+                    cfg,
+                )
             
             all_chunks.extend(page_chunks)
             chunk_index_offset += len(page_chunks)
@@ -67,12 +86,15 @@ class FixedSizeChunker(Chunker):
         namespace: str,
         tenant_id: str,
         page_number: Optional[int] = None,
-        chunk_index_offset: int = 0
+        chunk_index_offset: int = 0,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """Simple character-based chunking."""
+        cfg = config or ChunkingConfig()
+
         chunks = []
-        chunk_size = self.config.chunk_size
-        overlap = self.config.chunk_overlap
+        chunk_size = cfg.chunk_size
+        overlap = cfg.chunk_overlap
         
         start = 0
         chunk_index = chunk_index_offset
@@ -82,14 +104,17 @@ class FixedSizeChunker(Chunker):
             chunk_text = text[start:end]
             
             if chunk_text.strip():
-                chunks.append(self._create_chunk(
-                    text=chunk_text,
-                    document=document,
-                    chunk_index=chunk_index,
-                    namespace=namespace,
-                    tenant_id=tenant_id,
-                    page_number=page_number
-                ))
+                chunks.append(
+                    self._create_chunk(
+                        text=chunk_text,
+                        document=document,
+                        chunk_index=chunk_index,
+                        namespace=namespace,
+                        tenant_id=tenant_id,
+                        page_number=page_number,
+                        config=cfg,
+                    )
+                )
                 chunk_index += 1
             
             # If we've reached or passed the end, we're done
@@ -111,9 +136,12 @@ class FixedSizeChunker(Chunker):
         namespace: str,
         tenant_id: str,
         page_number: Optional[int] = None,
-        chunk_index_offset: int = 0
+        chunk_index_offset: int = 0,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """Chunk while respecting sentence boundaries."""
+        cfg = config or ChunkingConfig()
+
         # Split into sentences
         sentence_pattern = r'(?<=[.!?])\s+'
         sentences = re.split(sentence_pattern, text)
@@ -131,39 +159,45 @@ class FixedSizeChunker(Chunker):
             sentence_len = len(sentence)
             
             # If single sentence exceeds max size, split it
-            if sentence_len > self.config.chunk_size:
+            if sentence_len > cfg.chunk_size:
                 # Flush current chunk first
                 if current_chunk:
                     chunk_text = " ".join(current_chunk)
-                    chunks.append(self._create_chunk(
-                        text=chunk_text,
-                        document=document,
-                        chunk_index=chunk_index,
-                        namespace=namespace,
-                        tenant_id=tenant_id,
-                        page_number=page_number
-                    ))
+                    chunks.append(
+                        self._create_chunk(
+                            text=chunk_text,
+                            document=document,
+                            chunk_index=chunk_index,
+                            namespace=namespace,
+                            tenant_id=tenant_id,
+                            page_number=page_number,
+                            config=cfg,
+                        )
+                    )
                     chunk_index += 1
                     current_chunk = []
                     current_length = 0
                 
                 # Split long sentence by characters
-                for i in range(0, sentence_len, self.config.chunk_size - self.config.chunk_overlap):
-                    part = sentence[i:i + self.config.chunk_size]
+                for i in range(0, sentence_len, cfg.chunk_size - cfg.chunk_overlap):
+                    part = sentence[i : i + cfg.chunk_size]
                     if part.strip():
-                        chunks.append(self._create_chunk(
-                            text=part,
-                            document=document,
-                            chunk_index=chunk_index,
-                            namespace=namespace,
-                            tenant_id=tenant_id,
-                            page_number=page_number
-                        ))
+                        chunks.append(
+                            self._create_chunk(
+                                text=part,
+                                document=document,
+                                chunk_index=chunk_index,
+                                namespace=namespace,
+                                tenant_id=tenant_id,
+                                page_number=page_number,
+                                config=cfg,
+                            )
+                        )
                         chunk_index += 1
                 continue
             
             # Check if adding this sentence would exceed limit
-            if current_length + sentence_len + 1 > self.config.chunk_size:
+            if current_length + sentence_len + 1 > cfg.chunk_size:
                 # Flush current chunk
                 if current_chunk:
                     chunk_text = " ".join(current_chunk)
@@ -182,7 +216,7 @@ class FixedSizeChunker(Chunker):
                 overlap_text = ""
                 overlap_sentences = []
                 for s in reversed(current_chunk):
-                    if len(overlap_text) + len(s) + 1 <= self.config.chunk_overlap:
+                    if len(overlap_text) + len(s) + 1 <= cfg.chunk_overlap:
                         overlap_sentences.insert(0, s)
                         overlap_text = " ".join(overlap_sentences)
                     else:
@@ -197,13 +231,16 @@ class FixedSizeChunker(Chunker):
         # Flush remaining
         if current_chunk:
             chunk_text = " ".join(current_chunk)
-            chunks.append(self._create_chunk(
-                text=chunk_text,
-                document=document,
-                chunk_index=chunk_index,
-                namespace=namespace,
-                tenant_id=tenant_id,
-                page_number=page_number
-            ))
+            chunks.append(
+                self._create_chunk(
+                    text=chunk_text,
+                    document=document,
+                    chunk_index=chunk_index,
+                    namespace=namespace,
+                    tenant_id=tenant_id,
+                    page_number=page_number,
+                    config=cfg,
+                )
+            )
         
         return chunks

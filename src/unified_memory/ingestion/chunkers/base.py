@@ -62,9 +62,6 @@ class Chunker(ABC):
     - SemanticChunker: Embedding-based similarity grouping
     """
     
-    def __init__(self, config: Optional[ChunkingConfig] = None) -> None:
-        self.config = config or ChunkingConfig()
-    
     @property
     @abstractmethod
     def name(self) -> str:
@@ -77,6 +74,7 @@ class Chunker(ABC):
         document: ParsedDocument,
         namespace: str,
         tenant_id: str,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """
         Split a parsed document into chunks.
@@ -100,6 +98,7 @@ class Chunker(ABC):
         tenant_id: str,
         page_number: Optional[int] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        config: Optional[ChunkingConfig] = None,
     ) -> Chunk:
         """
         Helper to create a Chunk with proper metadata.
@@ -109,13 +108,15 @@ class Chunker(ABC):
         # Canonical content hash (TEXT modality by default for document chunks)
         content_hash = compute_content_hash(text, tenant_id, Modality.TEXT)
         
+        cfg = config or ChunkingConfig()
+
         metadata = {
             "chunker": self.name,
             "namespace": namespace,
             "document_id": document.document_id,
         }
         
-        if document.title and self.config.include_section_headers:
+        if document.title and cfg.include_section_headers:
             metadata["document_title"] = document.title
             
         if extra_metadata:

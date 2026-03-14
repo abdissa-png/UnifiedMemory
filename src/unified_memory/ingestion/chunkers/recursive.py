@@ -23,10 +23,8 @@ class RecursiveChunker(Chunker):
     
     def __init__(
         self,
-        config: Optional[ChunkingConfig] = None,
         separators: Optional[List[str]] = None,
     ) -> None:
-        super().__init__(config)
         self.separators = separators or ["\n\n", "\n", " ", ""]
     
     @property
@@ -38,10 +36,13 @@ class RecursiveChunker(Chunker):
         document: ParsedDocument,
         namespace: str,
         tenant_id: str,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """
         Split document recursively.
         """
+        cfg = config or ChunkingConfig()
+
         chunks = []
         chunk_idx = 0
         
@@ -59,10 +60,10 @@ class RecursiveChunker(Chunker):
             
             # Recursive splitting
             text_chunks = self._recursive_split(
-                text, 
+                text,
                 self.separators,
-                self.config.chunk_size,
-                self.config.chunk_overlap
+                cfg.chunk_size,
+                cfg.chunk_overlap,
             )
             
             for t in text_chunks:
@@ -74,7 +75,8 @@ class RecursiveChunker(Chunker):
                     chunk_index=chunk_idx,
                     namespace=namespace,
                     tenant_id=tenant_id,
-                    page_number=page.page_number
+                    page_number=page.page_number,
+                    config=cfg,
                 )
                 chunks.append(chunk)
                 chunk_idx += 1
