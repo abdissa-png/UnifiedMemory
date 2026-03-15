@@ -30,11 +30,24 @@ class SemanticChunker(Chunker):
     
     def __init__(
         self,
-        embedding_provider: EmbeddingProvider,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+        *,
+        provider_registry: Optional["ProviderRegistry"] = None,
+        namespace_manager: Optional["NamespaceManager"] = None,
         config: Optional[ChunkingConfig] = None,
     ) -> None:
-        super().__init__(config)
-        self.embedding_provider = embedding_provider
+        """
+        Create a SemanticChunker.
+
+        Two usage patterns are supported:
+        - Tests / standalone: pass an explicit ``embedding_provider``.
+        - Production: pass ``provider_registry`` and ``namespace_manager`` so
+          the chunker can resolve the tenant's embedding provider from the
+          namespace at call-time.
+        """
+        self._explicit_provider = embedding_provider
+        self._provider_registry = provider_registry
+        self._namespace_manager = namespace_manager
         self.similarity_threshold = config.similarity_threshold if config else 0.5
     
     @property
@@ -46,10 +59,17 @@ class SemanticChunker(Chunker):
         document: ParsedDocument,
         namespace: str,
         tenant_id: str,
+        config: Optional[ChunkingConfig] = None,
     ) -> List[Chunk]:
         """
         Split document into semantic chunks across pages.
         """
+        cfg = config or ChunkingConfig(similarity_threshold=self.similarity_threshold)
+
+        # Resolve embedding provider: prefer explicit instance (tests), otherwise
+        # resolve via ProviderRegistry based on the namespace / tenant config.
+        embedder = await self._resolve_embedding_provider(namespace)
+
         # 1. Concatenate all pages into continuous text with offset tracking
         full_text = ""
         page_map: List[Tuple[int, int, int]] = []  # (start, end, page_number)
@@ -72,7 +92,7 @@ class SemanticChunker(Chunker):
 
         # 2. Perform semantic splitting on the full text
         # Returns List of (text, start_index, end_index)
-        semantic_segments = await self._segment_semantics(full_text)
+        semantic_segments = await self._segment_semantics(full_text, cfg, embedder)
         
         chunks = []
         for i, (text, start, end) in enumerate(semantic_segments):
@@ -94,14 +114,58 @@ class SemanticChunker(Chunker):
                 extra_metadata={
                     "start_char": start,
                     "end_char": end,
-                    "is_semantic": True
-                }
+                    "is_semantic": True,
+                },
+                config=cfg,
             )
             chunks.append(chunk)
                 
         return chunks
 
-    async def _segment_semantics(self, text: str) -> List[Tuple[str, int, int]]:
+    async def _resolve_embedding_provider(self, namespace: str) -> EmbeddingProvider:
+        """
+        Determine which embedding provider to use for sentence embeddings.
+
+        Resolution order:
+        1. Explicit provider passed to constructor (used in unit tests).
+        2. ProviderRegistry + NamespaceManager → TenantConfig.text_embedding.
+        """
+        if self._explicit_provider is not None:
+            return self._explicit_provider
+
+        if self._provider_registry is None or self._namespace_manager is None:
+            raise ValueError(
+                "SemanticChunker requires either an explicit embedding_provider "
+                "or both provider_registry and namespace_manager to resolve one."
+            )
+
+        ns_config = await self._namespace_manager.get_config(namespace)
+        if not ns_config:
+            raise ValueError(f"Namespace not found for semantic chunking: {namespace}")
+
+        tenant_config = await self._namespace_manager.get_tenant_config(ns_config.tenant_id)
+        if not tenant_config:
+            raise ValueError(
+                f"Tenant config not found for semantic chunking (tenant={ns_config.tenant_id})."
+            )
+
+        model_cfg = tenant_config.text_embedding
+        # Allow tests/configs that register providers keyed only by model id.
+        embedder = self._provider_registry.resolve_embedding_provider(
+            model_cfg.provider,
+            model_cfg.model,
+            fallback_key=model_cfg.model,
+        )
+        if embedder is None:
+            raise ValueError(
+                f"No embedding provider available for semantic chunking; "
+                f"expected provider '{model_cfg.provider}' model '{model_cfg.model}'."
+            )
+        return embedder
+
+    async def _segment_semantics(
+        self, text: str, config: ChunkingConfig, embedding_provider: EmbeddingProvider
+    ) -> List[Tuple[str, int, int]]:
         """
         Split text into semantic segments with offsets.
         """
@@ -118,7 +182,7 @@ class SemanticChunker(Chunker):
         offsets = [(m.start(), m.end()) for m in matches]
             
         # 2. Embed sentences
-        embeddings = await self.embedding_provider.embed_batch(
+        embeddings = await embedding_provider.embed_batch(
             sentences, Modality.TEXT
         )
         
@@ -137,7 +201,7 @@ class SemanticChunker(Chunker):
             distances.append(1 - similarity)
         
         # 4. Determine split points
-        config_threshold = 1 - self.similarity_threshold
+        config_threshold = 1 - config.similarity_threshold
         
         segments = []
         current_sentences = [sentences[0]]

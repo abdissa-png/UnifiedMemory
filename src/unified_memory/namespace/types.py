@@ -102,6 +102,10 @@ class TenantConfig:
     chunk_overlap: Optional[int] = None
     chunker_type: str = "fixed_size"  # fixed_size, recursive, semantic
     respect_sentence_boundaries: bool = True
+    respect_paragraph_boundaries: bool = True
+    include_page_numbers: bool = True
+    include_section_headers: bool = True
+    similarity_threshold: float = 0.5
 
     # Vector index tuning
     index: IndexConfig = field(default_factory=IndexConfig)
