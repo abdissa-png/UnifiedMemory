@@ -28,7 +28,7 @@ from unified_memory.core.types import (
     source_locations_to_parallel_arrays,
 )
 from unified_memory.ingestion.parsers.base import DocumentParser, ParsedDocument
-from unified_memory.ingestion.chunkers.base import Chunker
+from unified_memory.ingestion.chunkers.base import Chunker, ChunkingConfig
 from unified_memory.embeddings.base import EmbeddingProvider
 from unified_memory.storage.base import VectorStoreBackend, GraphStoreBackend
 from unified_memory.cas.registry import CASRegistry
@@ -40,6 +40,7 @@ from unified_memory.cas.document_registry import DocumentRegistry
 from unified_memory.ingestion.parsers.registry import get_parser_registry, ParserRegistry
 from unified_memory.ingestion.chunkers.fixed_size import FixedSizeChunker, ChunkingConfig
 from unified_memory.ingestion.chunkers.recursive import RecursiveChunker
+from unified_memory.ingestion.chunkers.semantic import SemanticChunker
 from unified_memory.namespace.types import TenantConfig
 logger = logging.getLogger(__name__)
 
@@ -110,20 +111,40 @@ class IngestionPipeline:
         self.content_store = content_store
         self.namespace_manager = namespace_manager
         self.document_registry = document_registry
+        from unified_memory.core.registry import ProviderRegistry as _PR
+        self.provider_registry = provider_registry or _PR()
+
         self.graph_store = graph_store
         self.sparse_store = sparse_store
         self.vision_embedding_provider = vision_embedding_provider
         self.extractors: List[Extractor] = []
 
+        # Base chunker: when a custom chunker is provided, it is used for the
+        # "fixed_size" path.  Built-in recursive / semantic chunkers are kept
+        # as singleton instances and selected based on tenant chunker_type.
         self.chunker = chunker or FixedSizeChunker()
-        self.parser_registry = parser_registry or get_parser_registry()
+        self._fixed_chunker = self.chunker
+        self._recursive_chunker = RecursiveChunker()
+        self._semantic_chunker = SemanticChunker(
+            provider_registry=self.provider_registry,
+            namespace_manager=self.namespace_manager,
+        )
 
-        if parser_registry is None:
+        # Prefer the parser registry attached to ProviderRegistry when no
+        # explicit registry is supplied, so that parsers are centralised.
+        if parser_registry is not None:
+            self.parser_registry = parser_registry
+        else:
+            self.parser_registry = self.provider_registry.get_parser_registry()
             from unified_memory.ingestion.parsers.text import TextParser
+
             self.parser_registry.register(TextParser())
 
-        from unified_memory.core.registry import ProviderRegistry as _PR
-        self.provider_registry = provider_registry or _PR()
+            from unified_memory.ingestion.parsers.mineru_pdf import is_mineru_available
+            if is_mineru_available():
+                from unified_memory.ingestion.parsers.mineru_pdf import MinerUPDFParser
+                self.parser_registry.register(MinerUPDFParser())
+                logger.info("MinerU PDF parser registered")
 
         # Legacy: if an explicit embedding_provider is given, register it as
         # a process-wide fallback.  New code should resolve embedders via
@@ -150,7 +171,9 @@ class IngestionPipeline:
             )
         return self._fallback_embedder
 
-    def _build_chunker_for_tenant(self, tenant_config: TenantConfig) -> Chunker:
+    def _build_chunker_for_tenant(
+        self, tenant_config: TenantConfig
+    ) -> Tuple[Chunker, ChunkingConfig]:
         """
         Build a chunker instance based on tenant ingestion config.
 
@@ -164,20 +187,26 @@ class IngestionPipeline:
         chunk_overlap = (
             tenant_config.chunk_overlap if tenant_config.chunk_overlap is not None else 64
         )
+        respect_sentence_boundaries = tenant_config.respect_sentence_boundaries if tenant_config.respect_sentence_boundaries is not None else True
+        similarity_threshold = tenant_config.similarity_threshold if tenant_config.similarity_threshold is not None else 0.5
 
         config = ChunkingConfig(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            respect_sentence_boundaries=tenant_config.respect_sentence_boundaries,
+            respect_sentence_boundaries=respect_sentence_boundaries,
+            similarity_threshold=similarity_threshold,
         )
 
         chunker_type = (tenant_config.chunker_type or "fixed_size").lower()
 
         if chunker_type == "recursive":
-            return RecursiveChunker(config=config)
+            return self._recursive_chunker, config
+        if chunker_type == "semantic":
+            return self._semantic_chunker, config
 
-        # Fallback / default
-        return FixedSizeChunker(config=config)
+        # Fallback / default: fixed-size, using either the user-supplied
+        # chunker or the built-in FixedSizeChunker singleton.
+        return self._fixed_chunker, config
 
     def _resolve_embedder_from_tenant(self, tenant_config: Optional[TenantConfig]) -> EmbeddingProvider:
         """Resolve the embedding provider for a tenant via registry or fallback."""
@@ -233,13 +262,6 @@ class IngestionPipeline:
         if tenant_config and tenant_config.vision_embedding:
             model_cfg = tenant_config.vision_embedding
             embedder = self.provider_registry.resolve_vision_embedding_provider(
-                model_cfg.provider, model_cfg.model,
-            )
-            if embedder:
-                return embedder
-            # Backward-compat: some existing deployments register vision
-            # embedders in the text slot.
-            embedder = self.provider_registry.resolve_embedding_provider(
                 model_cfg.provider, model_cfg.model,
             )
             if embedder:
@@ -1019,8 +1041,13 @@ class IngestionPipeline:
             
             # Use tenant-configured chunker; always use the tenant-canonical
             # embedding model for hashing so stored artefacts are consistent.
-            req_chunker = self._build_chunker_for_tenant(tenant_config)
-            chunks = await req_chunker.chunk(parsed, namespace, tenant_id=ns_config.tenant_id)
+            req_chunker, chunk_cfg = self._build_chunker_for_tenant(tenant_config)
+            chunks = await req_chunker.chunk(
+                parsed,
+                namespace,
+                tenant_id=ns_config.tenant_id,
+                config=chunk_cfg,
+            )
 
             (
                 processing_errors,
@@ -1207,8 +1234,13 @@ class IngestionPipeline:
             )
             
             # Phase 1.5: Tenant Ingestion Config (chunker type + params)
-            req_chunker = self._build_chunker_for_tenant(tenant_config)
-            chunks = await req_chunker.chunk(parsed, namespace, tenant_id=ns_config.tenant_id)
+            req_chunker, chunk_cfg = self._build_chunker_for_tenant(tenant_config)
+            chunks = await req_chunker.chunk(
+                parsed,
+                namespace,
+                tenant_id=ns_config.tenant_id,
+                config=chunk_cfg,
+            )
             
             (
                 processing_errors,
