@@ -13,8 +13,15 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 from unified_memory.core.registry import ProviderRegistry
+from unified_memory.core.config import (
+    AppConfig,
+    load_app_config,
+    app_config_to_dict,
+    validate_config_compatibility,
+)
 from unified_memory.cas.registry import CASRegistry
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.cas.document_registry import DocumentRegistry
@@ -54,6 +61,9 @@ class SystemContext:
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or {}
+        # Store raw config for potential reloads
+        self._raw_config: Dict[str, Any] = config
+        self._app_config: Optional[AppConfig] = None
 
         self.kv_store = self._build_kv_store(config)
         self.vector_store = self._build_vector_store(config)
@@ -76,22 +86,90 @@ class SystemContext:
         self.search_service: Optional[UnifiedSearchService] = None
 
     # ------------------------------------------------------------------
+    # Alternate constructors / hot reload
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config_file(cls, path: str | Path) -> "SystemContext":
+        """
+        Build a SystemContext from a YAML config file.
+        """
+        app_cfg = load_app_config(Path(path))
+        errors = validate_config_compatibility(app_cfg)
+        if errors:
+            raise ValueError(
+                "Invalid application configuration:\n" + "\n".join(f"- {e}" for e in errors)
+            )
+        raw = app_config_to_dict(app_cfg)
+        ctx = cls(config=raw)
+        ctx._app_config = app_cfg
+        return ctx
+
+    def hot_reload_from_file(self, path: str | Path) -> "SystemContext":
+        """
+        Reload providers and services from a new YAML config while reusing the
+        existing infrastructure stores (KV, vector, graph).
+
+        This is intentionally conservative: it refuses to change infrastructure
+        backends at runtime and only updates provider registrations and
+        service wiring.
+        """
+        app_cfg = load_app_config(Path(path))
+        errors = validate_config_compatibility(app_cfg)
+        if errors:
+            raise ValueError(
+                "Invalid application configuration for hot reload:\n"
+                + "\n".join(f"- {e}" for e in errors)
+            )
+
+        # If we have a previous AppConfig, ensure infra choices haven't changed
+        if self._app_config is not None:
+            old = self._app_config.infra
+            new = app_cfg.infra
+            if (
+                old.kv_store != new.kv_store
+                or old.vector_store != new.vector_store
+                or old.graph_store != new.graph_store
+                or old.sparse_retriever != new.sparse_retriever
+            ):
+                raise ValueError(
+                    "Hot reload cannot change infrastructure backends "
+                    "(kv_store, vector_store, graph_store, sparse_retriever)."
+                )
+
+        # Rebuild provider registry and services using the new config while
+        # keeping existing stores.
+        self.provider_registry = ProviderRegistry()
+        raw = app_config_to_dict(app_cfg)
+        self._register_providers(raw)
+        self.build_services()
+        self._app_config = app_cfg
+        self._raw_config = raw
+        return self
+
+    # ------------------------------------------------------------------
     # Service construction
     # ------------------------------------------------------------------
 
     def build_services(
         self,
         *,
-        default_embedding_key: Optional[str] = None,
+        default_text_embedding_key: Optional[str] = None,
+        default_vision_embedding_key: Optional[str] = None,
     ) -> "SystemContext":
         """Build the ingestion pipeline and search service.
 
         Call after registering all providers.
         """
-        default_embedder = None
-        if default_embedding_key:
-            default_embedder = self.provider_registry.get_embedding_provider(
-                default_embedding_key
+        default_text_embedder = None
+        default_vision_embedder = None
+        if default_text_embedding_key:
+            default_text_embedder = self.provider_registry.get_embedding_provider(
+                default_text_embedding_key
+            )
+        if default_vision_embedding_key:
+            default_vision_embedder = self.provider_registry.get_vision_embedding_provider(
+                default_vision_embedding_key
             )
 
         sparse_retriever = self.elasticsearch_store
@@ -123,7 +201,8 @@ class SystemContext:
             document_registry=self.document_registry,
             namespace_manager=self.namespace_manager,
             provider_registry=self.provider_registry,
-            embedding_provider=default_embedder,
+            embedding_provider=default_text_embedder,
+            vision_embedding_provider=default_vision_embedder,
         )
 
         self.search_service = UnifiedSearchService(
@@ -195,6 +274,22 @@ class SystemContext:
     # ------------------------------------------------------------------
 
     def _register_providers(self, config: Dict[str, Any]) -> None:
+        # Document parsers — register built-in parsers eagerly so the
+        # ProviderRegistry's ParserRegistry is already populated before
+        # IngestionPipeline is constructed (useful when callers rely on
+        # provider_registry.get_parser_for_file() outside the pipeline).
+        from unified_memory.ingestion.parsers.text import TextParser
+
+        self.provider_registry.register_parser(TextParser())
+
+        from unified_memory.ingestion.parsers.mineru_pdf import is_mineru_available
+
+        if is_mineru_available():
+            from unified_memory.ingestion.parsers.mineru_pdf import MinerUPDFParser
+
+            self.provider_registry.register_parser(MinerUPDFParser())
+            logger.info("MinerU PDF parser registered via bootstrap")
+
         # Embedding providers — ``modality`` field routes to the right slot:
         #   "text"   (default) → text embedding registry
         #   "vision" or "image" → vision embedding registry
