@@ -165,6 +165,12 @@ class GraphRetriever:
                 "node_type": node_type.value if node_type else None,
                 "properties": node.properties,
             }
+            # Propagate content_hash when present so fusion can merge graph
+            # passages with dense/sparse hits for the same underlying chunk.
+            if node_type == NodeType.PASSAGE:
+                ch = node.properties.get("content_hash")
+                if ch:
+                    metadata["content_hash"] = ch
             result = RetrievalResult(
                 id=node.id,
                 content=content,

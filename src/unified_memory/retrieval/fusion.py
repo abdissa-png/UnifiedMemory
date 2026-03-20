@@ -61,6 +61,20 @@ def normalize_scores(results: List[RetrievalResult]) -> List[RetrievalResult]:
             
     return normalized_results
 
+
+def canonical_key(result: RetrievalResult) -> str:
+    """
+    Stable identity for cross-store fusion.
+
+    Preference order:
+    1. metadata["content_hash"] when present
+    2. result.id as a fallback
+    """
+    ch = result.metadata.get("content_hash")
+    if ch:
+        return ch
+    return result.id
+
 def reciprocal_rank_fusion(
     results: List[RetrievalResult],
     k: int = 60,
@@ -87,11 +101,12 @@ def reciprocal_rank_fusion(
     
     for source, source_results in by_source.items():
         for rank, r in enumerate(source_results):
-            if r.id not in rrf_scores:
-                rrf_scores[r.id] = 0.0
-                id_to_result[r.id] = r
-            
-            rrf_scores[r.id] += 1.0 / (k + rank + 1)
+            key = canonical_key(r)
+            if key not in rrf_scores:
+                rrf_scores[key] = 0.0
+                id_to_result[key] = r
+
+            rrf_scores[key] += 1.0 / (k + rank + 1)
             
     # Create fused results
     fused: List[RetrievalResult] = []
@@ -127,13 +142,14 @@ def linear_fusion(
     for r in results:
         source_weight = weights.get(r.source, 1.0)
         weighted_score = r.score * source_weight
-        
-        if r.id not in fused_scores:
-            fused_scores[r.id] = 0.0
-            id_to_result[r.id] = r
-        
+
+        key = canonical_key(r)
+        if key not in fused_scores:
+            fused_scores[key] = 0.0
+            id_to_result[key] = r
+
         # Max pool or Sum pool? Typically sum for linear combination
-        fused_scores[r.id] += weighted_score
+        fused_scores[key] += weighted_score
 
     fused: List[RetrievalResult] = []
     for rid, score in fused_scores.items():
