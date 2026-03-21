@@ -115,7 +115,7 @@ class UnifiedSearchService:
             target_namespaces = [namespace] + list(target_namespaces)
         
         # 5. Execute Paths in Parallel
-        tasks = []
+        tasks: List[Any] = []
 
         # Support either:
         # - `filters` applied to all paths, OR
@@ -123,10 +123,29 @@ class UnifiedSearchService:
         dense_filters = filters
         sparse_filters = filters
         graph_filters = filters
-        if isinstance(filters, dict) and any(k in filters for k in ("dense", "sparse", "graph")):
+        if isinstance(filters, dict) and any(
+            k in filters for k in ("dense", "sparse", "graph")
+        ):
             dense_filters = filters.get("dense")
             sparse_filters = filters.get("sparse")
             graph_filters = filters.get("graph")
+
+        # Allowlists are intentionally loose to avoid breaking existing callers.
+        dense_filters = self._validate_filters(
+            dense_filters,
+            allowed=["content_hash", "document_id", "status"],
+            store_name="dense",
+        )
+        sparse_filters = self._validate_filters(
+            sparse_filters,
+            allowed=["document_id", "source_doc_id", "source_doc_ids", "status"],
+            store_name="sparse",
+        )
+        graph_filters = self._validate_filters(
+            graph_filters,
+            allowed=["document_id", "node_type", "entity_type", "relation"],
+            store_name="graph",
+        )
         
         # Dense Path
         if "dense" in config.paths:
@@ -248,3 +267,34 @@ class UnifiedSearchService:
         except Exception as e:
             logger.error(f"Error in {source_name} retrieval: {e}", exc_info=True)
             return []
+
+    @staticmethod
+    def _validate_filters(
+        flt: Optional[Dict[str, Any]],
+        allowed: List[str],
+        store_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Drop unsupported filter keys before they reach individual stores.
+
+        - Always strips ``namespace`` / ``namespaces`` which are handled
+          separately by the orchestration layer.
+        - When ``allowed`` is non-empty, any other key is removed.
+        - When ``allowed`` is empty, all keys (except namespace fields) pass through.
+        """
+        if not flt:
+            return flt
+        cleaned: Dict[str, Any] = {}
+        for k, v in flt.items():
+            if k in ("namespace", "namespaces"):
+                # Namespace is always handled separately at the store level.
+                continue
+            if allowed and k not in allowed:
+                logger.warning(
+                    "Filter key '%s' not supported by %s; dropping from request.",
+                    k,
+                    store_name,
+                )
+                continue
+            cleaned[k] = v
+        return cleaned or None
