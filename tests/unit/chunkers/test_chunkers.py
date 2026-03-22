@@ -31,13 +31,13 @@ async def test_recursive_chunker_base_case():
     """Test that RecursiveChunker handles text with no separators left."""
     config = ChunkingConfig(chunk_size=10, chunk_overlap=0)
     # separators = [" "]
-    chunker = RecursiveChunker(config, separators=[" "])
+    chunker = RecursiveChunker(separators=[" "])
     
     pages = [PageContent(page_number=1, document_id="doc1", full_text="1234567890ABCDE")] # No space
     source = SourceReference(source_id="doc1", source_type=SourceType.TEXT_BLOCK)
     doc = ParsedDocument(document_id="doc1", source=source, pages=pages)
     
-    chunks = await chunker.chunk(doc, "ns", "model")
+    chunks = await chunker.chunk(doc, "ns", "model", config=config)
     
     # Should be split into "1234567890" and "ABCDE"
     assert len(chunks) == 2
@@ -49,7 +49,7 @@ async def test_recursive_chunker_overlap():
     """Test that RecursiveChunker correctly implements overlap."""
     # Chunk size 20, overlap 10
     config = ChunkingConfig(chunk_size=20, chunk_overlap=10)
-    chunker = RecursiveChunker(config, separators=[" "])
+    chunker = RecursiveChunker(separators=[" "])
     
     text = "word1 word2 word3 word4 word5 word6" 
     # Lengths: word1(5), word2(5), word3(5), word4(5), word5(5), word6(5)
@@ -68,7 +68,7 @@ async def test_recursive_chunker_overlap():
     source = SourceReference(source_id="doc1", source_type=SourceType.TEXT_BLOCK)
     doc = ParsedDocument(document_id="doc1", source=source, pages=pages)
     
-    chunks = await chunker.chunk(doc, "ns", "model")
+    chunks = await chunker.chunk(doc, "ns", "model", config=config)
     
     assert len(chunks) >= 2
     assert "word3" in chunks[0].content
@@ -78,7 +78,7 @@ async def test_recursive_chunker_overlap():
 async def test_fixed_size_chunker_character_overlap():
     """Verify simple character-based overlap."""
     config = ChunkingConfig(chunk_size=10, chunk_overlap=5, respect_sentence_boundaries=False)
-    chunker = FixedSizeChunker(config)
+    chunker = FixedSizeChunker()
     
     text = "abcdefghij12345" # 15 chars
     # Chunk 1: "abcdefghij" (0-10)
@@ -89,7 +89,7 @@ async def test_fixed_size_chunker_character_overlap():
     source = SourceReference(source_id="doc1", source_type=SourceType.TEXT_BLOCK)
     doc = ParsedDocument(document_id="doc1", source=source, pages=pages)
     
-    chunks = await chunker.chunk(doc, "ns", "model")
+    chunks = await chunker.chunk(doc, "ns", "model", config=config)
     assert len(chunks) == 2
     assert chunks[0].content == "abcdefghij"
     assert chunks[1].content == "fghij12345"
@@ -97,8 +97,8 @@ async def test_fixed_size_chunker_character_overlap():
 @pytest.mark.asyncio
 async def test_semantic_chunker_cross_page(mock_embedding_provider, sample_document):
     """Test that SemanticChunker concatenates pages and maps correctly."""
-    config = ChunkingConfig(similarity_threshold=0.9) # High threshold to force splits
-    chunker = SemanticChunker(mock_embedding_provider, config)
+    config = ChunkingConfig(similarity_threshold=0.9)  # High threshold to force splits
+    chunker = SemanticChunker(mock_embedding_provider)
     
     # Mock embeddings to force a split between page 1 and page 2
     # Sentence 1: "Sentence one."
@@ -109,7 +109,7 @@ async def test_semantic_chunker_cross_page(mock_embedding_provider, sample_docum
     # Mocking embed_batch is tricky, let's just run it with MockEmbeddingProvider
     # which returns random vectors (mostly dissimilar)
     
-    chunks = await chunker.chunk(sample_document, "ns", "model")
+    chunks = await chunker.chunk(sample_document, "ns", "model", config=config)
     
     assert len(chunks) > 0
     

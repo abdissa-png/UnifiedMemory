@@ -39,7 +39,7 @@ def document():
 @pytest.mark.asyncio
 async def test_semantic_chunking_with_mock(mock_embedding_provider, document):
     config = ChunkingConfig(similarity_threshold=0.99) # Very high threshold -> Force splits
-    chunker = SemanticChunker(mock_embedding_provider, config)
+    chunker = SemanticChunker(mock_embedding_provider, config=config)
     
     chunks = await chunker.chunk(document, "ns", "model-1")
     
@@ -57,7 +57,7 @@ async def test_semantic_chunking_single_block(mock_embedding_provider):
     # Test with very low threshold (high distance tolerance) -> Should keep together
     # Threshold -1.0 implies we tolerate distance up to 2.0 (max possible)
     config = ChunkingConfig(similarity_threshold=-1.0)
-    chunker = SemanticChunker(mock_embedding_provider, config)
+    chunker = SemanticChunker(mock_embedding_provider, config=config)
     
     text = "Sentence one. Sentence two."
     doc = ParsedDocument(

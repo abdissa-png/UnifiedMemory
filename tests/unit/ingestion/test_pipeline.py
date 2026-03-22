@@ -38,8 +38,7 @@ def mock_deps():
 
 @pytest.fixture
 def pipeline(mock_deps):
-    config = ChunkingConfig(chunk_size=100, chunk_overlap=20)
-    chunker = FixedSizeChunker(config)
+    chunker = FixedSizeChunker()
     # Remove 'kv' before splatting into IngestionPipeline
     deps = {k: v for k, v in mock_deps.items() if k != "kv"}
     return IngestionPipeline(
@@ -149,12 +148,7 @@ async def test_ingest_unsupported_file(pipeline):
 @pytest.mark.asyncio
 async def test_chunk_overlap(mock_deps):
     """Test that chunks have proper overlap while verifying full pipeline."""
-    config = ChunkingConfig(
-        chunk_size=50,
-        chunk_overlap=10,
-        respect_sentence_boundaries=False,
-    )
-    chunker = FixedSizeChunker(config)
+    chunker = FixedSizeChunker()
     # Remove 'kv' before splatting
     deps = {k: v for k, v in mock_deps.items() if k != "kv"}
     pipeline = IngestionPipeline(
