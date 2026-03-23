@@ -28,6 +28,6 @@ def test_build_services_with_mock_provider():
             }
         }
     )
-    ctx.build_services(default_embedding_key="mock:test-model")
+    ctx.build_services(default_text_embedding_key="mock:test-model", default_vision_embedding_key="mock:test-model")
     assert ctx.ingestion_pipeline is not None
     assert ctx.search_service is not None

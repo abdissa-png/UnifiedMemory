@@ -51,7 +51,7 @@ async def test_e2e_system_context_real_backends(tmp_path: Path):
         pytest.skip(
             f"SystemContext with real backends not available (e.g. aiohttp for ES): {e}"
         )
-    ctx.build_services(default_embedding_key="mock:mock-model")
+    ctx.build_services(default_text_embedding_key="mock:mock-model", default_vision_embedding_key="mock:mock-model")
 
     assert ctx.ingestion_pipeline is not None
     assert ctx.search_service is not None
