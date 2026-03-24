@@ -101,5 +101,33 @@ defaults:
   # modality "vision" / "image" / "shared").
   enable_visual_indexing: true
 
+# ---- Pricing (per-1M tokens unless noted) ----
+# Used at display time to compute cost from raw token counts.
+pricing:
+  openai:
+    text-embedding-3-small:
+      input: 0.02
+    text-embedding-3-large:
+      input: 0.13
+    gpt-4o-mini:
+      input: 0.15
+      output: 0.60
+      reasoning: 0.60
+    gpt-4o:
+      input: 2.50
+      output: 10.00
+      reasoning: 10.00
+  cohere:
+    rerank-english-v3.0:
+      search_units: 2.00  # per 1K searches
+
+# ---- Auth ----
+auth:
+  jwt_secret: "${UMS_JWT_SECRET}"
+  token_expiry_minutes: 60
+
+# ---- SQL database ----
+sql_database_url: "${UMS_DATABASE_URL}"
+
 config_version: 1
 

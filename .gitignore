@@ -1,9 +1,14 @@
 .pytest_cache
 **/*__pycache__
-**/*.md
 build
 **/*.egg-info
 **/*.dist-info
 .env
 .venv
 venv
+old_docs/
+.gemini
+.cursor
+docs/website/node_modules/
+docs/website/.docusaurus/
+docs/website/build/
