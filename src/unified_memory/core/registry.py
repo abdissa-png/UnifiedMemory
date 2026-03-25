@@ -41,6 +41,7 @@ class ProviderRegistry:
     def __init__(self) -> None:
         self._embedding_providers: Dict[str, EmbeddingProvider] = {}
         self._vision_embedding_providers: Dict[str, EmbeddingProvider] = {}
+        self._llm_providers: Dict[str, Any] = {}
         self._extractors: Dict[str, Extractor] = {}
         self._rerankers: Dict[str, Any] = {}
         self._parser_registry: ParserRegistry = get_parser_registry()
@@ -109,6 +110,19 @@ class ProviderRegistry:
         if result is None and fallback_key:
             result = self._vision_embedding_providers.get(fallback_key)
         return result
+
+    # ------------------------------------------------------------------
+    # LLM providers
+    # ------------------------------------------------------------------
+
+    def register_llm_provider(self, key: str, provider: Any) -> None:
+        if key in self._llm_providers:
+            logger.debug("LLM provider '%s' already registered, skipping.", key)
+            return
+        self._llm_providers[key] = provider
+
+    def get_llm_provider(self, key: str) -> Optional[Any]:
+        return self._llm_providers.get(key)
 
     # ------------------------------------------------------------------
     # Extractors

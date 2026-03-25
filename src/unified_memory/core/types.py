@@ -191,19 +191,21 @@ class NamespaceACL:
         principal: str,
         permission: Permission,
         roles: Optional[List[str]] = None,
+        tenant_acl: Optional["NamespaceACL"] = None,
     ) -> bool:
         """
-        Check if principal has permission.
+        Check if principal has permission, incorporating tenant inheritance.
 
         Args:
             principal: user_id to check
             permission: Permission to check
             roles: Optional list of roles the user has
+            tenant_acl: Optional tenant-level default ACL to fall back to if inherit_from_tenant is True
         """
 
         roles = roles or []
 
-        # Check explicit DENY first (highest priority)
+        # 1. Check explicit namespace DENY first (highest priority)
         for entry in self.entries:
             if entry.effect == ACLEffect.DENY and self._matches_principal(
                 entry, principal, roles
@@ -211,15 +213,32 @@ class NamespaceACL:
                 if permission in entry.permissions:
                     return False
 
-        # Check explicit ALLOW
+        # 2. Check explicit namespace ALLOW
         for entry in self.entries:
             if entry.effect == ACLEffect.ALLOW and self._matches_principal(
                 entry, principal, roles
             ):
                 if permission in entry.permissions:
                     return True
+                    
+        # 3. Check inherited ACL if permitted
+        if self.inherit_from_tenant and tenant_acl is not None:
+            # Check tenant DENY
+            for entry in tenant_acl.entries:
+                if entry.effect == ACLEffect.DENY and self._matches_principal(
+                    entry, principal, roles
+                ):
+                    if permission in entry.permissions:
+                        return False
+            # Check tenant ALLOW
+            for entry in tenant_acl.entries:
+                if entry.effect == ACLEffect.ALLOW and self._matches_principal(
+                    entry, principal, roles
+                ):
+                    if permission in entry.permissions:
+                        return True
 
-        # Default: DENY
+        # 4. Default: DENY
         return False
 
     def _matches_principal(
@@ -237,6 +256,49 @@ class NamespaceACL:
         if entry.principal_type == "role" and entry.principal in roles:
             return True
         return False
+
+    # ---- serialisation helpers ----
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dict (Enum values → strings)."""
+        return {
+            "entries": [
+                {
+                    "principal": e.principal,
+                    "principal_type": e.principal_type,
+                    "permissions": [p.value for p in e.permissions],
+                    "effect": e.effect.value,
+                    "inherited": e.inherited,
+                    "source_namespace": e.source_namespace,
+                }
+                for e in self.entries
+            ],
+            "inherit_from_parent": self.inherit_from_parent,
+            "inherit_from_tenant": self.inherit_from_tenant,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "NamespaceACL":
+        """Reconstruct from a dict produced by ``to_dict``."""
+        if not data:
+            return cls()
+        entries = []
+        for e in data.get("entries", []):
+            entries.append(
+                ACLEntry(
+                    principal=e["principal"],
+                    principal_type=e["principal_type"],
+                    permissions=[Permission(p) for p in e["permissions"]],
+                    effect=ACLEffect(e["effect"]),
+                    inherited=e.get("inherited", False),
+                    source_namespace=e.get("source_namespace"),
+                )
+            )
+        return cls(
+            entries=entries,
+            inherit_from_parent=data.get("inherit_from_parent", True),
+            inherit_from_tenant=data.get("inherit_from_tenant", True),
+        )
 
 
 class Modality(Enum):
