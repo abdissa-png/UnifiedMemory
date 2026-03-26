@@ -494,6 +494,49 @@ class Neo4jGraphStore(GraphStoreBackend):
             return success, was_last
         return await self.remove_namespace_from_edge(id, namespace)
 
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+    ) -> List[str]:
+        """Remove *document_id* from ``source_doc_ids`` /
+        ``source_chunk_indices`` on a node or edge.
+        Returns remaining ``source_doc_ids``."""
+        # Try node first
+        query_node = """
+        MATCH (n:Entity {id: $id})
+        WITH n,
+             [i IN range(0, size(n.source_doc_ids)-1)
+              WHERE n.source_doc_ids[i] <> $doc_id] AS keep
+        SET n.source_doc_ids = [i IN keep | n.source_doc_ids[i]],
+            n.source_chunk_indices = [i IN keep | n.source_chunk_indices[i]]
+        RETURN n.source_doc_ids AS remaining
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query_node, id=id, doc_id=document_id)
+            record = await result.single()
+            if record is not None:
+                return list(record["remaining"] or [])
+
+        # Try edge
+        query_edge = """
+        MATCH ()-[r]->()
+        WHERE r.id = $id
+        WITH r,
+             [i IN range(0, size(r.source_doc_ids)-1)
+              WHERE r.source_doc_ids[i] <> $doc_id] AS keep
+        SET r.source_doc_ids = [i IN keep | r.source_doc_ids[i]],
+            r.source_chunk_indices = [i IN keep | r.source_chunk_indices[i]]
+        RETURN r.source_doc_ids AS remaining
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query_edge, id=id, doc_id=document_id)
+            record = await result.single()
+            if record is not None:
+                return list(record["remaining"] or [])
+
+        return []
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------

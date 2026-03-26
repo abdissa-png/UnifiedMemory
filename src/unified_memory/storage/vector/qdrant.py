@@ -373,19 +373,20 @@ class QdrantVectorStore(VectorStoreBackend):
         collection: Optional[str] = None,
         document_id: Optional[str] = None,
     ) -> Tuple[bool, bool]:
-        """
-        Remove a namespace from a point. 
-        If document_id is provided, also remove the document reference.
-        
-        Returns:
-            (success, was_last_namespace)
+        """Unconditionally remove a namespace from a point.
+
+        Returns ``(success, was_last_namespace)``.  Hard-deletes the
+        point when no namespaces remain.  Callers that need
+        shared-document awareness should call
+        ``remove_document_reference`` first and only invoke this method
+        when the namespace is truly no longer needed.
         """
         if not collection:
             # Collection is required to disambiguate
             return False, False
- 
+
         collection = self._sanitize_collection_name(collection)
- 
+
         qid = _to_qdrant_id(id)
         points = await self.client.retrieve(
             collection_name=collection,
@@ -395,24 +396,14 @@ class QdrantVectorStore(VectorStoreBackend):
         )
         if not points:
             return False, False
- 
+
         p = points[0]
         payload = p.payload or {}
-        
-        # 1. Update namespaces
+
         namespaces = list(payload.get("namespaces") or [])
-        if namespace in namespaces:
-            namespaces.remove(namespace)
-            
-        # 2. Update source_doc_ids if requested
-        doc_ids = list(payload.get("source_doc_ids") or [])
-        if document_id and document_id in doc_ids:
-            doc_ids.remove(document_id)
-            
-        # 3. Update source_locations (remove all for this doc)
-        locations = list(payload.get("source_locations") or [])
-        if document_id:
-            locations = [loc for loc in locations if loc.get("document_id") != document_id]
+        if namespace not in namespaces:
+            return False, False
+        namespaces.remove(namespace)
 
         if not namespaces:
             # Hard delete if NO namespaces remain
@@ -421,18 +412,62 @@ class QdrantVectorStore(VectorStoreBackend):
                 points_selector=models.PointIdsList(points=[p.id]),
             )
             return True, True
- 
-        # Update payload
+
+        await self.client.set_payload(
+            collection_name=collection,
+            payload={"namespaces": namespaces},
+            points=[p.id],
+        )
+        return True, False
+
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+        collection: Optional[str] = None,
+    ) -> List[str]:
+        """Remove *document_id* from ``source_doc_ids`` /
+        ``source_locations`` without touching namespaces.
+
+        Returns the remaining ``source_doc_ids``.
+        """
+        if not collection:
+            return []
+
+        collection = self._sanitize_collection_name(collection)
+
+        qid = _to_qdrant_id(id)
+        points = await self.client.retrieve(
+            collection_name=collection,
+            ids=[qid],
+            with_payload=True,
+            with_vectors=False,
+        )
+        if not points:
+            return []
+
+        p = points[0]
+        payload = p.payload or {}
+
+        doc_ids = list(payload.get("source_doc_ids") or [])
+        if document_id in doc_ids:
+            doc_ids.remove(document_id)
+
+        locations = list(payload.get("source_locations") or [])
+        locations = [
+            loc for loc in locations
+            if loc.get("document_id") != document_id
+        ]
+
         await self.client.set_payload(
             collection_name=collection,
             payload={
-                "namespaces": namespaces,
                 "source_doc_ids": doc_ids,
                 "source_locations": locations,
             },
             points=[p.id],
         )
-        return True, False
+        return doc_ids
 
     async def get_by_id(
         self,

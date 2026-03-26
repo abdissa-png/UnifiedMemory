@@ -504,6 +504,47 @@ class NetworkXGraphStore(GraphStoreBackend):
             return success, was_last
         return await self.remove_namespace_from_edge(id, namespace)
 
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+    ) -> List[str]:
+        """Remove *document_id* from ``source_doc_ids`` /
+        ``source_chunk_indices`` on a node or edge without touching
+        namespaces.  Returns remaining ``source_doc_ids``."""
+        async with self._lock:
+            # Try node first
+            if self._graph.has_node(id):
+                data = self._graph.nodes[id]
+                doc_ids = list(data.get("source_doc_ids") or [])
+                chunk_idxs = list(data.get("source_chunk_indices") or [])
+                new_doc_ids = []
+                new_chunk_idxs = []
+                for d, c in zip(doc_ids, chunk_idxs):
+                    if d != document_id:
+                        new_doc_ids.append(d)
+                        new_chunk_idxs.append(c)
+                self._graph.nodes[id]["source_doc_ids"] = new_doc_ids
+                self._graph.nodes[id]["source_chunk_indices"] = new_chunk_idxs
+                return new_doc_ids
+
+            # Try edge
+            for u, v, k, data in self._graph.edges(keys=True, data=True):
+                if k == id:
+                    doc_ids = list(data.get("source_doc_ids") or [])
+                    chunk_idxs = list(data.get("source_chunk_indices") or [])
+                    new_doc_ids = []
+                    new_chunk_idxs = []
+                    for d, c in zip(doc_ids, chunk_idxs):
+                        if d != document_id:
+                            new_doc_ids.append(d)
+                            new_chunk_idxs.append(c)
+                    self._graph.edges[u, v, k]["source_doc_ids"] = new_doc_ids
+                    self._graph.edges[u, v, k]["source_chunk_indices"] = new_chunk_idxs
+                    return new_doc_ids
+
+        return []
+
     async def personalized_pagerank(
         self,
         seed_nodes: List[str],

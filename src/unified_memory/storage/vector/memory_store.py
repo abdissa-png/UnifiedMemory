@@ -193,11 +193,15 @@ class MemoryVectorStore(VectorStoreBackend):
         collection: Optional[str] = None,
         document_id: Optional[str] = None,
     ) -> Tuple[bool, bool]:
-        """
-        Remove namespace from a vector's namespace list.
-        
-        Returns:
-            (success, was_last_namespace)
+        """Remove a namespace from a vector's namespace list.
+
+        Returns ``(success, was_last_namespace)``.  When
+        ``was_last_namespace`` is ``True`` the vector was hard-deleted.
+
+        This method **unconditionally** removes the namespace.  Callers
+        that need shared-document awareness should call
+        ``remove_document_reference`` first and only invoke this method
+        when the namespace is no longer needed.
         """
         target_collections = [collection] if collection else list(self._collections.keys())
         async with self._lock:
@@ -208,31 +212,50 @@ class MemoryVectorStore(VectorStoreBackend):
                         ns_list = self._get_namespaces(store[id])
                         if namespace in ns_list:
                             ns_list.remove(namespace)
-                            
-                            payload = store[id]["metadata"]
-                            
-                            # Update source_doc_ids if present
-                            doc_ids = list(payload.get("source_doc_ids") or [])
-                            if document_id and document_id in doc_ids:
-                                doc_ids.remove(document_id)
-                                payload["source_doc_ids"] = doc_ids
-                                
-                            # Update source_locations if present
-                            locations = list(payload.get("source_locations") or [])
-                            if document_id:
-                                locations = [loc for loc in locations if loc.get("document_id") != document_id]
-                                payload["source_locations"] = locations
 
                             if not ns_list:
-                                # Last namespace removed — hard delete
                                 del store[id]
                                 return True, True
-                                
+
                             store[id]["namespaces"] = ns_list
-                            # Sync to metadata
-                            payload["namespaces"] = ns_list
+                            store[id]["metadata"]["namespaces"] = ns_list
                             return True, False
             return False, False
+
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+        collection: Optional[str] = None,
+    ) -> List[str]:
+        """Remove *document_id* from ``source_doc_ids`` / ``source_locations``
+        without touching namespaces.
+
+        Returns the remaining ``source_doc_ids`` so the caller can decide
+        whether the namespace should also be removed.
+        """
+        target_collections = [collection] if collection else list(self._collections.keys())
+        async with self._lock:
+            for col_name in target_collections:
+                if col_name in self._collections:
+                    store = self._collections[col_name]
+                    if id in store:
+                        payload = store[id]["metadata"]
+
+                        doc_ids = list(payload.get("source_doc_ids") or [])
+                        if document_id in doc_ids:
+                            doc_ids.remove(document_id)
+                            payload["source_doc_ids"] = doc_ids
+
+                        locations = list(payload.get("source_locations") or [])
+                        locations = [
+                            loc for loc in locations
+                            if loc.get("document_id") != document_id
+                        ]
+                        payload["source_locations"] = locations
+
+                        return doc_ids
+            return []
 
     async def get_by_id(
         self,

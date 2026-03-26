@@ -309,6 +309,21 @@ class VectorStoreBackend(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+        collection: Optional[str] = None,
+    ) -> List[str]:
+        """Remove a document from a vector's ``source_doc_ids`` /
+        ``source_locations`` without touching the namespaces list.
+
+        Returns the **remaining** ``source_doc_ids`` after removal so the
+        caller can decide whether the namespace should also be removed.
+        """
+        raise NotImplementedError
+
 
 class VectorStoreTransaction:
     """
@@ -593,5 +608,18 @@ class GraphStoreBackend(Protocol):
 
         Returns (success, was_last_namespace).
         If the edge has no remaining namespaces it is deleted.
+        """
+        ...
+
+    async def remove_document_reference(
+        self,
+        id: str,
+        document_id: str,
+    ) -> List[str]:
+        """Remove *document_id* from ``source_doc_ids`` /
+        ``source_locations`` on a node or edge without touching
+        namespaces.
+
+        Returns the remaining ``source_doc_ids``.
         """
         ...

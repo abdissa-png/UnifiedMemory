@@ -235,40 +235,65 @@ class ElasticSearchStore:
         namespace: str,
         document_id: Optional[str] = None,
     ) -> int:
-        """
-        Namespace-aware delete with source_doc_ids cleanup.
+        """Unconditionally remove *namespace* from entries in
+        Elasticsearch.  Hard-deletes the document when no namespaces
+        remain.  For the smart-deletion flow, prefer calling
+        ``remove_document_reference`` first and only invoking this
+        method when the namespace should truly be removed.
         """
         affected = 0
         for content_id in doc_ids:
             try:
                 doc = await self._es.get(index=self._index, id=content_id)
                 src = doc.get("_source", {}) or {}
-                
+
                 namespaces = list(src.get("namespaces") or [])
                 if namespace in namespaces:
                     namespaces.remove(namespace)
-                
-                source_doc_ids = list(src.get("source_doc_ids") or [])
-                if document_id and document_id in source_doc_ids:
-                    source_doc_ids.remove(document_id)
-                
+
                 if not namespaces:
                     await self._es.delete(index=self._index, id=content_id)
                 else:
                     await self._es.update(
                         index=self._index,
                         id=content_id,
-                        body={
-                            "doc": {
-                                "namespaces": namespaces,
-                                "source_doc_ids": source_doc_ids
-                            }
-                        },
+                        body={"doc": {"namespaces": namespaces}},
                     )
                 affected += 1
             except Exception:
                 continue
         return affected
+
+    async def remove_document_reference(
+        self,
+        doc_ids: List[str],
+        namespace: str,
+        document_id: str,
+    ) -> Dict[str, List[str]]:
+        """Remove *document_id* from ``source_doc_ids`` on matching
+        entries **without** touching namespaces.
+
+        Returns ``{content_id: remaining_doc_ids}`` so the caller can
+        decide whether to also remove the namespace.
+        """
+        remaining_map: Dict[str, List[str]] = {}
+        for content_id in doc_ids:
+            try:
+                doc = await self._es.get(index=self._index, id=content_id)
+                src = doc.get("_source", {}) or {}
+
+                source_doc_ids = list(src.get("source_doc_ids") or [])
+                if document_id in source_doc_ids:
+                    source_doc_ids.remove(document_id)
+                    await self._es.update(
+                        index=self._index,
+                        id=content_id,
+                        body={"doc": {"source_doc_ids": source_doc_ids}},
+                    )
+                remaining_map[content_id] = source_doc_ids
+            except Exception:
+                continue
+        return remaining_map
 
     async def close(self) -> None:
         await self._es.close()
