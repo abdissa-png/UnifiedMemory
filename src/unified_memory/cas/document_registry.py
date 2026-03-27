@@ -85,6 +85,11 @@ class DocumentRegistry:
         """Key schema: doc_reg:{tenant_id}:{doc_hash}"""
         return f"doc_reg:{tenant_id}:{doc_hash}"
 
+    @staticmethod
+    def _idx_key(document_id: str) -> str:
+        """Reverse-index key: doc_id_idx:{document_id} → {tenant_id, doc_hash}."""
+        return f"doc_id_idx:{document_id}"
+
     async def get_document(self, tenant_id: str, doc_hash: str) -> Optional[DocumentEntry]:
         """Look up document by content hash within a tenant."""
         key = self._key(tenant_id, doc_hash)
@@ -92,6 +97,17 @@ class DocumentRegistry:
         if not versioned:
             return None
         return DocumentEntry.from_dict(versioned.data)
+
+    async def get_document_by_document_id(self, document_id: str) -> Optional[DocumentEntry]:
+        """Reverse lookup: find a document entry by its ``document_id``.
+
+        This relies on the secondary index written during
+        ``register_document``.
+        """
+        idx = await self._store.get(self._idx_key(document_id))
+        if not idx:
+            return None
+        return await self.get_document(idx.data["tenant_id"], idx.data["doc_hash"])
 
     async def register_document(
         self, 
@@ -126,6 +142,10 @@ class DocumentRegistry:
         
         success = await self._store.set_if_not_exists(key, new_entry.to_dict())
         if success:
+            await self._store.set(
+                self._idx_key(document_id),
+                {"tenant_id": tenant_id, "doc_hash": doc_hash},
+            )
             return True
         else:
             # Race condition: someone else created it. Add namespace to theirs.
@@ -269,3 +289,97 @@ class DocumentRegistry:
             await asyncio.sleep(0.01 * (attempt + 1))
             
         return False
+
+    # ------------------------------------------------------------------
+    # Namespace → Documents secondary index
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ns_docs_key(namespace: str) -> str:
+        """Index key: ``idx:ns_docs:{namespace}`` → list of doc entries."""
+        return f"idx:ns_docs:{namespace}"
+
+    async def add_doc_to_namespace_index(
+        self,
+        namespace: str,
+        doc_hash: str,
+        document_id: str,
+    ) -> bool:
+        """Add a document to the namespace-level document index (CAS loop).
+
+        This enables ``list_documents`` to enumerate all documents in a
+        namespace without scanning the entire registry.
+        """
+        key = self._ns_docs_key(namespace)
+
+        for attempt in range(5):
+            versioned = await self._store.get(key)
+
+            if versioned:
+                docs: List[Dict[str, str]] = versioned.data.get("docs", [])
+            else:
+                docs = []
+
+            # Check if already present
+            for entry in docs:
+                if entry.get("doc_hash") == doc_hash:
+                    return True  # Already indexed
+
+            docs.append({"doc_hash": doc_hash, "document_id": document_id})
+
+            if versioned:
+                success = await self._store.compare_and_swap(
+                    key, versioned.version, {"docs": docs}
+                )
+            else:
+                success = await self._store.set_if_not_exists(key, {"docs": docs})
+
+            if success:
+                return True
+
+            await asyncio.sleep(0.01 * (attempt + 1))
+
+        return False
+
+    async def remove_doc_from_namespace_index(
+        self,
+        namespace: str,
+        doc_hash: str,
+    ) -> bool:
+        """Remove a document from the namespace-level document index."""
+        key = self._ns_docs_key(namespace)
+
+        for attempt in range(5):
+            versioned = await self._store.get(key)
+            if not versioned:
+                return True  # Nothing to remove
+
+            docs: List[Dict[str, str]] = versioned.data.get("docs", [])
+            new_docs = [d for d in docs if d.get("doc_hash") != doc_hash]
+
+            if len(new_docs) == len(docs):
+                return True  # Not present
+
+            if not new_docs:
+                success = await self._store.delete_if_version(key, versioned.version)
+            else:
+                success = await self._store.compare_and_swap(
+                    key, versioned.version, {"docs": new_docs}
+                )
+
+            if success:
+                return True
+
+            await asyncio.sleep(0.01 * (attempt + 1))
+
+        return False
+
+    async def get_namespace_documents(
+        self, namespace: str
+    ) -> List[Dict[str, str]]:
+        """Return all ``{doc_hash, document_id}`` entries for a namespace."""
+        key = self._ns_docs_key(namespace)
+        versioned = await self._store.get(key)
+        if not versioned:
+            return []
+        return versioned.data.get("docs", [])
