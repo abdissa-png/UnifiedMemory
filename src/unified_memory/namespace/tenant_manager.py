@@ -84,16 +84,22 @@ class TenantManager:
     async def register_tenant(
         self,
         tenant_id: str,
+        admin_user_id: str,
         text_embedding: Optional[EmbeddingModelConfig] = None,
         vision_embedding: Optional[EmbeddingModelConfig] = None,
+        **kwargs
     ) -> TenantConfig:
+        """Register a new tenant with default ACL granting admin full access.
+        
+        Optional kwargs allow overriding other TenantConfig defaults (e.g. chunk_size,
+        chunker_type, enable_graph_storage).
         """
-        Helper to register a new tenant.
-
-        Design alignment:
-        - Accept full EmbeddingModelConfig objects instead of bare model strings.
-        - Provide sensible defaults when configs are not supplied.
-        """
+        from unified_memory.core.types import (
+            Permission,
+            ACLEntry,
+            ACLEffect,
+            NamespaceACL,
+        )
 
         # Default text embedding model if not provided
         if text_embedding is None:
@@ -103,14 +109,36 @@ class TenantManager:
                 dimension=1536,
             )
 
-        kw_args = {
+        # Build a tenant-level default ACL
+        acl_entries = [
+            ACLEntry(
+                principal=admin_user_id,
+                principal_type="user",
+                permissions=list(Permission),
+                effect=ACLEffect.ALLOW,
+            ),
+            # All tenant members get READ by default
+            ACLEntry(
+                principal="tenant_member",
+                principal_type="role",
+                permissions=[Permission.READ],
+                effect=ACLEffect.ALLOW,
+            )
+        ]
+        
+        default_acl = NamespaceACL(entries=acl_entries).to_dict()
+
+        kw_args: dict = {
             "tenant_id": tenant_id,
             "text_embedding": text_embedding,
+            "default_acl": default_acl,
         }
 
         # Optional vision embedding override (otherwise TenantConfig default applies)
         if vision_embedding is not None:
             kw_args["vision_embedding"] = vision_embedding
+            
+        kw_args.update(kwargs)
 
         config = TenantConfig(**kw_args)
 

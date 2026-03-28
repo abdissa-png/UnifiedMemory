@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
 import hashlib
 
-from unified_memory.core.types import NamespaceACL, Modality
+from unified_memory.core.types import NamespaceACL, ACLEntry, ACLEffect, Permission, Modality
 from unified_memory.core.utils import utc_now
 
 
@@ -128,8 +128,28 @@ class TenantConfig:
     batch_size: int = 100
     deduplication_enabled: bool = True
 
+    # Tenant-level LLM choice for QAAgent
+    llm: Optional[Dict[str, Any]] = None  # serialised LLMConfig.to_dict()
+
+    # Tenant-level default ACL inherited by all new namespaces
+    default_acl: Optional[Dict] = None  # serialised NamespaceACL.to_dict()
+
     created_at: str = field(default_factory=lambda: utc_now().isoformat())
     updated_at: str = ""
+
+
+@dataclass
+class LLMConfig:
+    provider: str
+    model: str
+    api_key_ref: Optional[str] = None
+    
+    def to_dict(self):
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "api_key_ref": self.api_key_ref,
+        }
 
 
 @dataclass

@@ -14,7 +14,14 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
 
-from unified_memory.core.types import CollectionType, Modality
+from unified_memory.core.types import (
+    CollectionType,
+    Modality,
+    Permission,
+    ACLEntry,
+    ACLEffect,
+    NamespaceACL,
+)
 from unified_memory.core.utils import utc_now
 from unified_memory.namespace.types import (
     NamespaceConfig,
@@ -71,7 +78,12 @@ class NamespaceManager:
         if not versioned:
             return None
 
-        config = NamespaceConfig(**versioned.data)
+        data = versioned.data
+        # Deserialise ACL from dict if stored as plain dict
+        if "acl" in data and isinstance(data["acl"], dict):
+            data["acl"] = NamespaceACL.from_dict(data["acl"])
+
+        config = NamespaceConfig(**data)
         cache[namespace] = config
         return config
 
@@ -81,8 +93,24 @@ class NamespaceManager:
         user_id: str,
         agent_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        scope: str = "private",
     ) -> NamespaceConfig:
-        """Create a new namespace with configuration."""
+        """Create a new namespace with owner-full-permission ACL."""
+
+        owner_acl = NamespaceACL(entries=[
+            ACLEntry(
+                principal=user_id,
+                principal_type="user",
+                permissions=[
+                    Permission.READ,
+                    Permission.WRITE,
+                    Permission.DELETE,
+                    Permission.ADMIN,
+                    Permission.SHARE,
+                ],
+                effect=ACLEffect.ALLOW,
+            ),
+        ])
 
         config = NamespaceConfig(
             tenant_id=tenant_id,
@@ -90,6 +118,8 @@ class NamespaceManager:
             agent_id=agent_id,
             session_id=session_id,
             namespace_id="",  # derived in __post_init__
+            acl=owner_acl,
+            scope=scope,
         )
 
         # Validate generated ID
@@ -100,7 +130,7 @@ class NamespaceManager:
         if existing_config:
             raise ValueError(f"Namespace already exists: {config.namespace_id}")
 
-        await self.kv_store.set(f"ns_config:{config.namespace_id}", asdict(config))
+        await self._save_config(config)
 
         # Update secondary indexes for fast lookup
         await self._update_user_namespace_index(
@@ -117,16 +147,111 @@ class NamespaceManager:
                 namespace_id=config.namespace_id,
                 add=True,
             )
+            
+        return config
 
+    # ---- sharing -----------------------------------------------------------
+
+    async def share_namespace(
+        self,
+        namespace_id: str,
+        target_user_id: str,
+        permissions: List[Permission],
+    ) -> NamespaceConfig:
+        """Grant *target_user_id* the given permissions on *namespace_id*."""
+        config = await self.get_config(namespace_id)
+        if not config:
+            raise ValueError(f"Namespace not found: {namespace_id}")
+
+        config.acl.entries.append(
+            ACLEntry(
+                principal=target_user_id,
+                principal_type="user",
+                permissions=permissions,
+                effect=ACLEffect.ALLOW,
+            )
+        )
+        if config.scope == "private":
+            config.scope = "shared"
+        config.updated_at = utc_now().isoformat()
+        await self._save_config(config)
+
+        await self._update_acl_access_index(
+            tenant_id=config.tenant_id,
+            user_id=target_user_id,
+            namespace_id=namespace_id,
+            add=True,
+        )
+        return config
+
+    async def unshare_namespace(
+        self,
+        namespace_id: str,
+        target_user_id: str,
+    ) -> NamespaceConfig:
+        """Revoke all permissions for *target_user_id* on *namespace_id*."""
+        config = await self.get_config(namespace_id)
+        if not config:
+            raise ValueError(f"Namespace not found: {namespace_id}")
+
+        config.acl.entries = [
+            e
+            for e in config.acl.entries
+            if not (e.principal_type == "user" and e.principal == target_user_id)
+        ]
+        config.updated_at = utc_now().isoformat()
+        await self._save_config(config)
+
+        await self._update_acl_access_index(
+            tenant_id=config.tenant_id,
+            user_id=target_user_id,
+            namespace_id=namespace_id,
+            add=False,
+        )
+        return config
+
+    async def delete_namespace(self, namespace_id: str) -> bool:
+        """Remove namespace config and all secondary indexes."""
+        config = await self.get_config(namespace_id)
+        if not config:
+            return False
+
+        await self.kv_store.delete(f"ns_config:{namespace_id}")
+
+        await self._update_user_namespace_index(
+            tenant_id=config.tenant_id,
+            user_id=config.user_id,
+            namespace_id=namespace_id,
+            add=False,
+        )
+        if config.scope == "public":
+            await self._update_public_namespace_index(
+                tenant_id=config.tenant_id,
+                namespace_id=namespace_id,
+                add=False,
+            )
+
+        # Remove from acl_access indexes for every explicitly shared user
+        for entry in config.acl.entries:
+            if (
+                entry.principal_type == "user"
+                and entry.principal != config.user_id
+            ):
+                await self._update_acl_access_index(
+                    tenant_id=config.tenant_id,
+                    user_id=entry.principal,
+                    namespace_id=namespace_id,
+                    add=False,
+                )
+
+        # Invalidate cache
         try:
             cache = _request_namespace_cache.get()
+            cache.pop(namespace_id, None)
         except LookupError:
-            cache = {}
-            _request_namespace_cache.set(cache)
-        
-        cache[config.namespace_id] = config
+            pass
 
-        return config
+        return True
 
     async def get_embedding_model(
         self,
@@ -272,6 +397,39 @@ class NamespaceManager:
         """
 
         key = f"idx:user_namespaces:{tenant_id}:{user_id}"
+        versioned = await self.kv_store.get(key)
+        data = versioned.data if versioned else {"namespaces": []}
+        ns_set = set(data.get("namespaces", []))
+        if add:
+            ns_set.add(namespace_id)
+        else:
+            ns_set.discard(namespace_id)
+        data["namespaces"] = list(ns_set)
+        await self.kv_store.set(key, data)
+
+    async def _save_config(self, config: NamespaceConfig) -> None:
+        """Persist a NamespaceConfig with proper ACL serialisation."""
+        data = asdict(config)
+        # Replace the raw asdict ACL (which keeps Enum objects) with a safe dict
+        data["acl"] = config.acl.to_dict()
+        await self.kv_store.set(f"ns_config:{config.namespace_id}", data)
+
+        # Invalidate cache entry so next get_config sees the update
+        try:
+            cache = _request_namespace_cache.get()
+            cache[config.namespace_id] = config
+        except LookupError:
+            pass
+
+    async def _update_acl_access_index(
+        self,
+        tenant_id: str,
+        user_id: str,
+        namespace_id: str,
+        add: bool = True,
+    ) -> None:
+        """Maintain the idx:acl_access:{tenant}:{user} index."""
+        key = f"idx:acl_access:{tenant_id}:{user_id}"
         versioned = await self.kv_store.get(key)
         data = versioned.data if versioned else {"namespaces": []}
         ns_set = set(data.get("namespaces", []))
