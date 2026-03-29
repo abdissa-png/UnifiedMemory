@@ -73,6 +73,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             model=self._model,
             dimensions=self._dimension,
         )
+        self._record_usage(response.usage)
         return response.data[0].embedding
 
     async def embed_batch(
@@ -93,5 +94,22 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             )
             for item in response.data:
                 all_embeddings[start + item.index] = item.embedding
+            self._record_usage(response.usage)
 
         return all_embeddings
+
+    def _record_usage(self, usage) -> None:
+        """Extract token counts from CreateEmbeddingResponse.usage."""
+        try:
+            from unified_memory.observability.tracing import record_usage, UsageRecord
+
+            record_usage(
+                UsageRecord(
+                    service="openai",
+                    model=self._model,
+                    operation="embedding",
+                    input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                )
+            )
+        except Exception:
+            pass

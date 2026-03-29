@@ -42,6 +42,7 @@ class BaseLLMProvider(ABC):
         max_output_tokens: int = 1024,
         temperature: float = 0.7,
         stop_sequences: Optional[List[str]] = None,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         ...
 
@@ -51,6 +52,7 @@ class BaseLLMProvider(ABC):
         prompt: str,
         max_output_tokens: int = 1024,
         temperature: float = 0.0,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         """Generate with temperature=0 for deterministic structured output."""
         ...
@@ -60,6 +62,7 @@ class BaseLLMProvider(ABC):
         prompt: str,
         images: List[bytes],
         max_output_tokens: int = 1024,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         """Generate a response using both text and image inputs.
 

@@ -80,6 +80,7 @@ class OpenAILLMProvider(BaseLLMProvider):
         max_output_tokens: int = 1024,
         temperature: float = 0.7,
         stop_sequences: Optional[List[str]] = None,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         from langchain_core.messages import HumanMessage
 
@@ -89,6 +90,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             self._llm.stop = stop_sequences
 
         response = await self._llm.ainvoke([HumanMessage(content=prompt)])
+        self._record_llm_usage(response, usage_callback)
         return str(response.content)
 
     async def generate_structured(
@@ -96,11 +98,13 @@ class OpenAILLMProvider(BaseLLMProvider):
         prompt: str,
         max_output_tokens: int = 1024,
         temperature: float = 0.0,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         return await self.generate(
             prompt,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            usage_callback=usage_callback,
         )
 
     async def generate_with_images(
@@ -108,6 +112,7 @@ class OpenAILLMProvider(BaseLLMProvider):
         prompt: str,
         images: List[bytes],
         max_output_tokens: int = 1024,
+        usage_callback: Optional[Any] = None,
     ) -> str:
         """Generate a response from text + image inputs.
 
@@ -136,4 +141,40 @@ class OpenAILLMProvider(BaseLLMProvider):
 
         self._llm.max_tokens = max_output_tokens
         response = await self._llm.ainvoke([HumanMessage(content=content)])
+        self._record_llm_usage(response, usage_callback)
         return str(response.content)
+
+    def _record_llm_usage(self, response, usage_callback: Optional[Any] = None) -> None:
+        """Extract usage_metadata from AIMessage."""
+        try:
+            from unified_memory.observability.tracing import record_usage, UsageRecord
+
+            usage = getattr(response, "usage_metadata", None)
+            if not usage:
+                return
+            output_details = usage.get("output_token_details", {}) or {}
+            input_details = usage.get("input_token_details", {}) or {}
+            
+            i_toks = usage.get("input_tokens", 0)
+            o_toks = usage.get("output_tokens", 0)
+            r_toks = usage.get("reasoning_tokens", 0)
+            if usage_callback:
+                try:
+                    usage_callback(i_toks, o_toks, r_toks)
+                except Exception:
+                    logger.exception("Usage callback failed")
+
+            record_usage(
+                UsageRecord(
+                    service="openai",
+                    model=self._model,
+                    operation="completion",
+                    input_tokens=i_toks,
+                    output_tokens=o_toks,
+                    reasoning_tokens=r_toks,
+                    cache_read_tokens=input_details.get("cache_read", 0),
+                    cache_creation_tokens=input_details.get("cache_creation", 0),
+                )
+            )
+        except Exception:
+            pass
