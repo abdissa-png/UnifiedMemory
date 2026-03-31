@@ -21,6 +21,7 @@ from unified_memory.core.registry import ProviderRegistry
 from .dense import DenseRetriever
 from .graph import GraphRetriever
 from .fusion import normalize_scores, reciprocal_rank_fusion, linear_fusion
+from unified_memory.observability.tracing import traced
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class UnifiedSearchService:
         self.dense_retriever: DenseRetriever = dense_retriever 
         self.graph_retriever: GraphRetriever = graph_retriever
 
+    @traced("search.unified")
     async def search(
         self,
         query: str,
@@ -133,17 +135,17 @@ class UnifiedSearchService:
         # Allowlists are intentionally loose to avoid breaking existing callers.
         dense_filters = self._validate_filters(
             dense_filters,
-            allowed=["content_hash", "document_id", "status"],
+            allowed=["document_id", "source_doc_id", "source_doc_ids"],
             store_name="dense",
         )
         sparse_filters = self._validate_filters(
             sparse_filters,
-            allowed=["document_id", "source_doc_id", "source_doc_ids", "status"],
+            allowed=["document_id", "source_doc_id", "source_doc_ids"],
             store_name="sparse",
         )
         graph_filters = self._validate_filters(
             graph_filters,
-            allowed=["document_id", "node_type", "entity_type", "relation"],
+            allowed=["document_id", "node_type", "source_doc_id", "source_doc_ids"],
             store_name="graph",
         )
         

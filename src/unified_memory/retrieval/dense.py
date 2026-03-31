@@ -12,6 +12,7 @@ from unified_memory.storage.base import VectorStoreBackend
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.namespace.manager import NamespaceManager
 from unified_memory.core.interfaces import EmbeddingProvider
+from unified_memory.observability.tracing import traced
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class DenseRetriever:
         self.namespace_manager = namespace_manager
         self.content_store = content_store
     
+    @traced("search.dense")
     async def retrieve(
         self,
         query: str,

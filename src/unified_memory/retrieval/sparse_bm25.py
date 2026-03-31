@@ -199,51 +199,77 @@ class BM25SparseRetriever:
         namespace: str,
         document_id: Optional[str] = None,
     ) -> int:
-        """
-        Delete documents from index.
-        - If document_id is provided, only remove it from that doc's provenance.
-        - If no document_id or it was the last one, remove the doc from the namespace.
+        """Delete documents from index (unconditional namespace-level removal).
+
+        When *document_id* is supplied the entry's ``source_doc_ids``
+        metadata is trimmed, but the entry is only removed from the
+        namespace when no ``source_doc_ids`` remain.  For the
+        smart-deletion flow, prefer calling
+        ``remove_document_reference`` first and only invoking this
+        method when the namespace should truly be removed.
         """
         if namespace not in self._documents:
             return 0
-            
+
         current_docs = self._documents[namespace]
         to_delete_ids = set(doc_ids)
         new_docs = []
         affected = 0
-        
+
         for doc_id, content, metadata in current_docs:
             if doc_id in to_delete_ids:
                 if document_id:
-                    # Specific document provenance removal
                     doc_ids_list = list(metadata.get("source_doc_ids") or [])
                     if document_id in doc_ids_list:
                         doc_ids_list.remove(document_id)
                         metadata["source_doc_ids"] = doc_ids_list
                         affected += 1
-                    
+
                     if doc_ids_list:
                         new_docs.append((doc_id, content, metadata))
                     else:
-                        # Last document removed, delete content entirely from this namespace
                         affected += 1
                 else:
-                    # Hard delete from this namespace
                     affected += 1
             else:
                 new_docs.append((doc_id, content, metadata))
-                
+
         if affected == 0:
             return 0
-            
+
         self._documents[namespace] = new_docs
-        
-        # Rebuild index
+
         corpus_tokens = [self._tokenize(d[1]) for d in new_docs]
         if corpus_tokens:
             self._indices[namespace] = BM25Plus(corpus_tokens, delta=0)
         else:
             if namespace in self._indices:
                 del self._indices[namespace]
-                
+
         return affected
+
+    async def remove_document_reference(
+        self,
+        doc_ids: List[str],
+        namespace: str,
+        document_id: str,
+    ) -> Dict[str, List[str]]:
+        """Remove *document_id* from ``source_doc_ids`` on matching
+        entries **without** removing the entry from the namespace.
+
+        Returns ``{content_hash: remaining_doc_ids}`` for each matched
+        entry so the caller can decide whether to hard-delete.
+        """
+        remaining_map: Dict[str, List[str]] = {}
+        if namespace not in self._documents:
+            return remaining_map
+
+        for doc_id, content, metadata in self._documents[namespace]:
+            if doc_id in doc_ids:
+                doc_ids_list = list(metadata.get("source_doc_ids") or [])
+                if document_id in doc_ids_list:
+                    doc_ids_list.remove(document_id)
+                    metadata["source_doc_ids"] = doc_ids_list
+                remaining_map[doc_id] = doc_ids_list
+
+        return remaining_map

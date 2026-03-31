@@ -26,7 +26,7 @@ class CohereReranker:
         except ImportError:
             raise ImportError("Cohere support requires 'cohere' package: pip install cohere")
             
-        self.client = cohere.Client(api_key)
+        self.client = cohere.AsyncClient(api_key=api_key)
         self._model_id = model
         
     @property
@@ -54,17 +54,23 @@ class CohereReranker:
             
         try:
             # Cohere API call (synchronous, run in executor)
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: self.client.rerank(
+            # loop = asyncio.get_event_loop()
+            # response = await loop.run_in_executor(
+            #     None,
+            #     lambda: self.client.rerank(
+            #         model=self._model_id,
+            #         query=query,
+            #         documents=documents,
+            #         top_n=top_k,
+            #     )
+            # )
+            response = await self.client.rerank(
                     model=self._model_id,
                     query=query,
                     documents=documents,
                     top_n=top_k,
                 )
-            )
-            
+            self._record_rerank_usage(response)
             # Map back
             reranked = []
             for item in response.results:
@@ -91,6 +97,28 @@ class CohereReranker:
         except Exception as e:
             logger.error(f"Cohere reranking failed: {e}")
             return results[:top_k] # Fallback to original order
+
+    def _record_rerank_usage(self, response) -> None:
+        try:
+            from unified_memory.observability.tracing import record_usage, UsageRecord
+
+            meta = getattr(response, "meta", None)
+            if not meta:
+                return
+            billed = getattr(meta, "billed_units", None)
+            if not billed:
+                return
+            record_usage(
+                UsageRecord(
+                    service="cohere",
+                    model=self._model_id,
+                    operation="rerank",
+                    input_tokens=int(getattr(billed, "input_tokens", 0) or 0),
+                    search_units=int(getattr(billed, "search_units", 0) or 0),
+                )
+            )
+        except Exception:
+            pass
 
 
 class BGEReranker:
