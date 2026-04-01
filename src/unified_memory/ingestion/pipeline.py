@@ -42,6 +42,7 @@ from unified_memory.ingestion.chunkers.fixed_size import FixedSizeChunker, Chunk
 from unified_memory.ingestion.chunkers.recursive import RecursiveChunker
 from unified_memory.ingestion.chunkers.semantic import SemanticChunker
 from unified_memory.namespace.types import TenantConfig
+from unified_memory.observability.tracing import traced
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +56,7 @@ class IngestionResult:
     chunks: List[Chunk] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     deduped: bool = False  # True if document was already present
+    doc_hash: str = ""  # Content-addressable hash for the document
 
     @property
     def success(self) -> bool:
@@ -103,6 +105,9 @@ class IngestionPipeline:
         provider_registry: Optional['ProviderRegistry'] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
         default_extractor_key: str = "default",
+        artifact_store: Optional[Any] = None,
+        image_content_store: Optional[Any] = None,
+        document_content_store: Optional[Any] = None,
     ) -> None:
         from unified_memory.ingestion.chunkers.fixed_size import FixedSizeChunker
 
@@ -151,6 +156,9 @@ class IngestionPipeline:
         # ProviderRegistry and tenant configuration instead of touching this.
         self._fallback_embedder = embedding_provider
         self._default_extractor_key = default_extractor_key
+        self._artifact_store = artifact_store
+        self.image_content_store = image_content_store
+        self.document_content_store = document_content_store
 
     @property
     def embedding_provider(self) -> EmbeddingProvider:
@@ -208,19 +216,26 @@ class IngestionPipeline:
         # chunker or the built-in FixedSizeChunker singleton.
         return self._fixed_chunker, config
 
+    @staticmethod
+    def _cfg_attr(model_cfg, attr: str):
+        """Access an attribute on an EmbeddingModelConfig-like object,
+        whether it is a dataclass instance or a plain dict (serialised)."""
+        if isinstance(model_cfg, dict):
+            return model_cfg.get(attr)
+        return getattr(model_cfg, attr, None)
+
     def _resolve_embedder_from_tenant(self, tenant_config: Optional[TenantConfig]) -> EmbeddingProvider:
         """Resolve the embedding provider for a tenant via registry or fallback."""
         if tenant_config:
             model_cfg = tenant_config.text_embedding
-            embedder = self.provider_registry.resolve_embedding_provider(
-                model_cfg.provider,
-                model_cfg.model,
-                # Fallback to plain model key (e.g. "mock:mock-model") for tests
-                # and configs that register providers keyed only by model id.
-                fallback_key=model_cfg.model,
-            )
-            if embedder:
-                return embedder
+            provider = self._cfg_attr(model_cfg, "provider")
+            model = self._cfg_attr(model_cfg, "model")
+            if provider and model:
+                embedder = self.provider_registry.resolve_embedding_provider(
+                    provider, model, fallback_key=model,
+                )
+                if embedder:
+                    return embedder
         if self._fallback_embedder:
             return self._fallback_embedder
         raise ValueError(
@@ -261,12 +276,1242 @@ class IngestionPipeline:
         """
         if tenant_config and tenant_config.vision_embedding:
             model_cfg = tenant_config.vision_embedding
-            embedder = self.provider_registry.resolve_vision_embedding_provider(
-                model_cfg.provider, model_cfg.model,
-            )
-            if embedder:
-                return embedder
+            provider = self._cfg_attr(model_cfg, "provider")
+            model = self._cfg_attr(model_cfg, "model")
+            if provider and model:
+                embedder = self.provider_registry.resolve_vision_embedding_provider(
+                    provider, model,
+                )
+                if embedder:
+                    return embedder
         return self.vision_embedding_provider
+
+    # ===================================================================
+    # Step methods — granular, resumable ingestion steps
+    #
+    # Each method is self-contained: all data inputs arrive as
+    # parameters and outputs are JSON-serialisable dicts.  The methods
+    # mirror the logic in _process_chunks / ingest_file / ingest_text
+    # so they can later replace the monolithic code path.
+    # ===================================================================
+
+    @traced("ingestion.resolve_context")
+    async def step_resolve_context(self, namespace: str) -> dict:
+        """Resolve tenant/namespace config and provider availability.
+
+        Returns a JSON-serialisable dict with the **full** tenant config
+        plus convenience flags derived from it, so downstream steps never
+        need to re-fetch the config from the namespace manager.
+        """
+        from dataclasses import asdict as _asdict
+
+        ns_config = await self.namespace_manager.get_config(namespace)
+        tenant_id = ns_config.tenant_id if ns_config else "default"
+        tenant_config = await self.namespace_manager.get_tenant_config(tenant_id)
+
+        text_embedding_model = (
+            tenant_config.text_embedding.model if tenant_config else "default"
+        )
+        vision_embedding_model = (
+            tenant_config.vision_embedding.model
+            if tenant_config and tenant_config.vision_embedding
+            else ""
+        )
+
+        raw_ext = tenant_config.extraction if tenant_config else None
+        if isinstance(raw_ext, dict):
+            extraction_config = (
+                ExtractionConfig(
+                    **{
+                        k: v
+                        for k, v in raw_ext.items()
+                        if k in ExtractionConfig.__dataclass_fields__
+                    }
+                )
+                if raw_ext
+                else None
+            )
+        else:
+            extraction_config = raw_ext
+
+        enable_graph = bool(
+            getattr(tenant_config, "enable_graph_storage", False)
+            if tenant_config
+            else False
+        )
+        enable_visual = bool(
+            getattr(tenant_config, "enable_visual_indexing", False)
+            if tenant_config
+            else False
+        )
+        enable_entity_extraction = bool(
+            getattr(tenant_config, "enable_entity_extraction", False)
+            if tenant_config
+            else False
+        )
+        enable_relation_extraction = bool(
+            getattr(tenant_config, "enable_relation_extraction", False)
+            if tenant_config
+            else False
+        )
+
+        page_snippet_length = (
+            tenant_config.page_snippet_length
+            if tenant_config and hasattr(tenant_config, "page_snippet_length")
+            else 200
+        )
+
+        extraction_config_dict = (
+            _asdict(extraction_config) if extraction_config else None
+        )
+
+        tenant_config_dict = _asdict(tenant_config) if tenant_config else {}
+
+        return {
+            "tenant_id": tenant_id,
+            "namespace": namespace,
+            "text_embedding_model": text_embedding_model,
+            "vision_embedding_model": vision_embedding_model,
+            "tenant_config": tenant_config_dict,
+            # Convenience flags (derived from tenant_config for readability)
+            "enable_graph": enable_graph,
+            "enable_visual": enable_visual,
+            "enable_entity_extraction": enable_entity_extraction,
+            "enable_relation_extraction": enable_relation_extraction,
+            "page_snippet_length": page_snippet_length,
+            "extraction_config": extraction_config_dict,
+        }
+
+    @traced("ingestion.parse")
+    async def step_parse_and_externalize(
+        self,
+        source_path_or_text,
+        document_id: str,
+        job_id: str,
+        artifact_store: "ArtifactStore",
+        is_file: bool = True,
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **options: Any,
+    ) -> dict:
+        """Parse a document (file or raw text) and externalise heavy payloads.
+
+        For *file* input the parser registry selects the right parser.
+        For *text* input a minimal ``ParsedDocument`` is built inline.
+
+        Page images, figure image bytes, and table image bytes are stored
+        in *artifact_store* and stripped from the in-memory document.  The
+        text-only ``ParsedDocument`` is then serialised to the artifact
+        store as JSON.
+        """
+        from unified_memory.workflows.serialization import (
+            parsed_doc_to_dict,
+            source_ref_to_dict,
+        )
+        from unified_memory.core.types import PageContent
+
+        if is_file:
+            path = (
+                Path(source_path_or_text)
+                if not isinstance(source_path_or_text, Path)
+                else source_path_or_text
+            )
+            parser = self.parser_registry.get_parser_for_file(path)
+            if not parser:
+                return {"error": f"No parser for {path.suffix}"}
+            parsed = await parser.parse_file(path, document_id, **options)
+        else:
+            parsed = ParsedDocument(
+                document_id=document_id,
+                source=SourceReference(
+                    source_id=document_id, source_type=SourceType.TEXT_BLOCK
+                ),
+                title=title,
+                pages=[
+                    PageContent(
+                        page_number=1,
+                        document_id=document_id,
+                        text_blocks=[{"text": source_path_or_text}],
+                        full_text=source_path_or_text,
+                    )
+                ],
+                full_text=source_path_or_text,
+                metadata=metadata or {},
+            )
+
+        page_image_uris: List[dict] = []
+
+        for page in parsed.pages:
+            if page.full_page_image:
+                uri = await artifact_store.put_bytes(
+                    page.full_page_image,
+                    key=f"jobs/{job_id}/pages/{document_id}/{page.page_number}/full_page.bin",
+                )
+                page_image_uris.append(
+                    {"page_number": page.page_number, "uri": uri}
+                )
+                page.full_page_image = None
+
+            for fig_idx, fig in enumerate(page.figures):
+                if fig.get("image_bytes"):
+                    fig_uri = await artifact_store.put_bytes(
+                        fig["image_bytes"],
+                        key=(
+                            f"jobs/{job_id}/pages/{document_id}/"
+                            f"{page.page_number}/fig_{fig_idx}.bin"
+                        ),
+                    )
+                    fig["image_uri"] = fig_uri
+                    del fig["image_bytes"]
+
+            for tbl_idx, tbl in enumerate(page.tables):
+                if tbl.get("image_bytes"):
+                    tbl_uri = await artifact_store.put_bytes(
+                        tbl["image_bytes"],
+                        key=(
+                            f"jobs/{job_id}/pages/{document_id}/"
+                            f"{page.page_number}/tbl_{tbl_idx}.bin"
+                        ),
+                    )
+                    tbl["image_uri"] = tbl_uri
+                    del tbl["image_bytes"]
+
+        doc_dict = parsed_doc_to_dict(parsed)
+        parsed_uri = await artifact_store.put_json(
+            doc_dict,
+            key=f"jobs/{job_id}/parsed/{document_id}.json",
+        )
+
+        return {
+            "document_id": document_id,
+            "parsed_artifact_uri": parsed_uri,
+            "page_image_uris": page_image_uris,
+            "page_count": parsed.page_count,
+            "full_text": parsed.full_text,
+            "source": source_ref_to_dict(parsed.source),
+            "parse_errors": parsed.parse_errors,
+        }
+
+    @traced("ingestion.dedup_check")
+    async def step_dedup_check(
+        self, tenant_id: str, doc_hash: str, namespace: str
+    ) -> dict:
+        """Check whether a document already exists in the registry.
+
+        Returns a dict whose ``decision`` field is one of:
+        - ``"skip"``         — document already present in this namespace.
+        - ``"fast_link"``    — document exists in another namespace.
+        - ``"full_ingest"``  — document is new.
+        """
+        existing_doc = await self.document_registry.get_document(
+            tenant_id, doc_hash
+        )
+
+        if not existing_doc:
+            return {"decision": "full_ingest"}
+
+        entry_data = {
+            "existing_document_id": existing_doc.document_id,
+            "chunk_content_hashes": existing_doc.chunk_content_hashes,
+            "text_vector_ids": existing_doc.text_vector_ids,
+            "entity_vector_ids": existing_doc.entity_vector_ids,
+            "relation_vector_ids": existing_doc.relation_vector_ids,
+            "page_image_vector_ids": existing_doc.page_image_vector_ids,
+            "graph_node_ids": existing_doc.graph_node_ids,
+            "graph_edge_ids": existing_doc.graph_edge_ids,
+        }
+
+        if namespace in existing_doc.namespaces:
+            return {"decision": "skip", **entry_data}
+
+        return {"decision": "fast_link", **entry_data}
+
+    @traced("ingestion.fast_link")
+    async def step_fast_link(
+        self,
+        tenant_id: str,
+        doc_hash: str,
+        namespace: str,
+        existing_entry_dict: dict,
+        ctx: Optional[dict] = None,
+    ) -> dict:
+        """Fast-link: add a new namespace to an already-ingested document.
+
+        Replicates Path B from ``ingest_file`` / ``ingest_text``:
+        registers the namespace, adds CAS references, grants vector and
+        graph access, and re-indexes sparse storage.
+
+        When *ctx* (from ``step_resolve_context``) is provided the method
+        avoids re-fetching the tenant config.
+        """
+        existing_document_id = existing_entry_dict["existing_document_id"]
+        chunk_content_hashes = existing_entry_dict["chunk_content_hashes"]
+        text_vector_ids = existing_entry_dict.get("text_vector_ids", [])
+        entity_vector_ids = existing_entry_dict.get("entity_vector_ids", [])
+        relation_vector_ids = existing_entry_dict.get("relation_vector_ids", [])
+        page_image_vector_ids = existing_entry_dict.get(
+            "page_image_vector_ids", []
+        )
+        graph_node_ids = existing_entry_dict.get("graph_node_ids", [])
+        graph_edge_ids = existing_entry_dict.get("graph_edge_ids", [])
+
+        await self.document_registry.add_namespace(
+            tenant_id, doc_hash, namespace
+        )
+
+        for i, content_hash in enumerate(chunk_content_hashes):
+            await self.cas_registry.add_reference(
+                content_hash=content_hash,
+                namespace=namespace,
+                document_id=existing_document_id,
+                chunk_index=i,
+            )
+
+        all_vec_ids = (
+            text_vector_ids
+            + entity_vector_ids
+            + relation_vector_ids
+            + page_image_vector_ids
+        )
+        for vec_id in all_vec_ids:
+            await self.vector_store.add_namespace(vec_id, namespace)
+
+        enable_graph = (
+            ctx.get("enable_graph", False) if ctx else False
+        )
+        if not ctx:
+            tc = await self.namespace_manager.get_tenant_config(tenant_id)
+            enable_graph = bool(
+                getattr(tc, "enable_graph_storage", False) if tc else False
+            )
+        if self.graph_store and enable_graph:
+            all_graph_ids = graph_node_ids + graph_edge_ids
+            for gid in all_graph_ids:
+                await self.graph_store.add_namespace(gid, namespace)
+
+        if self.sparse_store and chunk_content_hashes:
+            sparse_docs: List[Dict[str, Any]] = []
+            for h in chunk_content_hashes:
+                content = await self.content_store.get_content(h)
+                if content:
+                    sparse_docs.append(
+                        {
+                            "id": h,
+                            "content": content,
+                            "metadata": {
+                                "document_id": existing_document_id
+                            },
+                        }
+                    )
+            if sparse_docs:
+                await self.sparse_store.index(sparse_docs, namespace)
+
+        return {
+            "document_id": existing_document_id,
+            "chunk_content_hashes": chunk_content_hashes,
+            "chunk_count": len(chunk_content_hashes),
+            "deduped": True,
+        }
+
+    @traced("ingestion.register_and_chunk")
+    async def step_register_and_chunk(
+        self,
+        tenant_id: str,
+        doc_hash: str,
+        namespace: str,
+        document_id: str,
+        parsed_artifact_uri: str,
+        job_id: str,
+        artifact_store: "ArtifactStore",
+        ctx: dict,
+    ) -> dict:
+        """Register a new document and chunk it.
+
+        1. Registers the document in ``DocumentRegistry``.
+        2. Loads the parsed document from the artifact store.
+        3. Chunks using the tenant-configured chunker.
+        4. Stores chunk text in ``ContentStore``.
+        5. Returns a chunk manifest dict.
+        """
+        from unified_memory.workflows.serialization import (
+            parsed_doc_from_dict,
+            chunk_ref_to_dict,
+        )
+
+        await self.document_registry.register_document(
+            tenant_id, doc_hash, namespace, document_id
+        )
+
+        doc_dict = await artifact_store.get_json(parsed_artifact_uri)
+        parsed = parsed_doc_from_dict(doc_dict)
+
+        tc_dict = ctx.get("tenant_config", {})
+        tenant_config = TenantConfig(**{
+            k: v for k, v in tc_dict.items()
+            if k in TenantConfig.__dataclass_fields__
+        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        req_chunker, chunk_cfg = self._build_chunker_for_tenant(tenant_config)
+        chunks = await req_chunker.chunk(
+            parsed, namespace, tenant_id=tenant_id, config=chunk_cfg
+        )
+
+        chunk_refs: List[dict] = []
+        chunk_content_hashes: List[str] = []
+
+        for chunk in chunks:
+            if not chunk.content_hash:
+                chunk.content_hash = compute_content_hash(
+                    chunk.content, tenant_id, Modality.TEXT
+                )
+            await self.content_store.store_content(
+                chunk.content_hash, chunk.content
+            )
+            chunk_refs.append(chunk_ref_to_dict(chunk))
+            chunk_content_hashes.append(chunk.content_hash)
+
+        manifest_uri = await artifact_store.put_json(
+            {"chunks": chunk_refs},
+            key=f"jobs/{job_id}/chunks/{document_id}.json",
+        )
+
+        return {
+            "document_id": document_id,
+            "chunk_manifest_uri": manifest_uri,
+            "chunk_count": len(chunks),
+            "chunk_content_hashes": chunk_content_hashes,
+        }
+
+    @traced("ingestion.embed_text")
+    async def step_embed_and_upsert_text(
+        self,
+        namespace: str,
+        tenant_id: str,
+        chunk_content_hashes: List[str],
+        document_id: str,
+        ctx: dict,
+        batch_size: int = 64,
+    ) -> dict:
+        """CAS-aware text embedding and vector upsert.
+
+        For each chunk content hash:
+        1. Check CAS for an existing vector with the current model.
+        2. Embed missing chunks in batches.
+        3. Register/update CAS entries.
+        4. Upsert new vectors; add namespace to existing vectors.
+        """
+        from unified_memory.core.types import compute_vector_id
+
+        embedding_model = ctx["text_embedding_model"]
+        tc_dict = ctx.get("tenant_config", {})
+        tenant_config = TenantConfig(**{
+            k: v for k, v in tc_dict.items()
+            if k in TenantConfig.__dataclass_fields__
+        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        embedder = self._resolve_embedder_from_tenant(tenant_config)
+
+        text_collection = await self.namespace_manager.get_collection_name(
+            namespace, CollectionType.TEXTS
+        )
+
+        text_vector_ids: List[str] = []
+        errors: List[str] = []
+
+        hashes_needing_embed: List[str] = []
+        seen: set = set()
+
+        for content_hash in chunk_content_hashes:
+            if content_hash in seen:
+                continue
+            seen.add(content_hash)
+
+            expected_vid = compute_vector_id(content_hash, embedding_model)
+            entry = await self.cas_registry.get_entry(content_hash)
+
+            if entry and entry.vector_id == expected_vid:
+                pass
+            else:
+                hashes_needing_embed.append(content_hash)
+
+        hash_to_embedding: Dict[str, Any] = {}
+        if hashes_needing_embed:
+            contents: List[str] = []
+            valid_hashes: List[str] = []
+            for h in hashes_needing_embed:
+                content = await self.content_store.get_content(h)
+                if content:
+                    contents.append(content)
+                    valid_hashes.append(h)
+
+            try:
+                for start in range(0, len(valid_hashes), batch_size):
+                    batch_h = valid_hashes[start : start + batch_size]
+                    batch_c = contents[start : start + batch_size]
+                    embeddings = await embedder.embed_batch(
+                        batch_c, modality=Modality.TEXT
+                    )
+                    for h, emb in zip(batch_h, embeddings):
+                        hash_to_embedding[h] = emb
+            except Exception as e:
+                logger.exception("Text embedding failed")
+                return {
+                    "text_vector_ids": [],
+                    "errors": [f"Embedding error: {str(e)}"],
+                }
+
+        vectors_to_upsert: List[Dict[str, Any]] = []
+        upserted_hashes: set = set()
+
+        for idx, content_hash in enumerate(chunk_content_hashes):
+            vector_id = compute_vector_id(
+                content_hash, embedding_model, "text"
+            )
+            content_id = f"content:{content_hash}"
+            chunk_loc = SourceLocation(
+                document_id=document_id, chunk_index=idx
+            )
+
+            try:
+                await self.cas_registry.register(
+                    content_hash=content_hash,
+                    content_id=content_id,
+                    vector_id=vector_id,
+                )
+                await self.cas_registry.add_reference(
+                    content_hash=content_hash,
+                    namespace=namespace,
+                    document_id=document_id,
+                    chunk_index=idx,
+                )
+
+                if (
+                    content_hash in hash_to_embedding
+                    and content_hash not in upserted_hashes
+                ):
+                    vectors_to_upsert.append(
+                        {
+                            "id": vector_id,
+                            "embedding": hash_to_embedding[content_hash],
+                            "metadata": {
+                                "content_hash": content_hash,
+                                "document_id": document_id,
+                                "source_locations": [chunk_loc.to_dict()],
+                            },
+                        }
+                    )
+                    upserted_hashes.add(content_hash)
+                else:
+                    await self.vector_store.add_namespace(
+                        vector_id,
+                        namespace,
+                        collection=text_collection,
+                        document_id=document_id,
+                    )
+
+                text_vector_ids.append(vector_id)
+            except Exception as e:
+                logger.exception(
+                    "Failed to process chunk hash %s", content_hash
+                )
+                errors.append(f"Chunk processing error: {str(e)}")
+
+        if vectors_to_upsert:
+            try:
+                await self.vector_store.upsert(
+                    vectors_to_upsert, namespace, collection=text_collection
+                )
+            except Exception as e:
+                logger.error(f"Batch text vector upsert failed: {e}")
+                errors.append(f"Vector batch error: {str(e)}")
+
+        return {"text_vector_ids": text_vector_ids, "errors": errors}
+
+    @traced("ingestion.sparse_upsert")
+    async def step_sparse_upsert(
+        self,
+        namespace: str,
+        chunk_content_hashes: List[str],
+        document_id: str,
+    ) -> dict:
+        """Index chunks in the sparse (BM25) store."""
+        if not self.sparse_store:
+            return {"indexed": 0, "errors": []}
+
+        sparse_docs: List[Dict[str, Any]] = []
+        for content_hash in chunk_content_hashes:
+            content = await self.content_store.get_content(content_hash)
+            if content:
+                sparse_docs.append(
+                    {
+                        "id": content_hash,
+                        "content": content,
+                        "metadata": {"document_id": document_id},
+                    }
+                )
+
+        errors: List[str] = []
+        if sparse_docs:
+            try:
+                await self.sparse_store.index(sparse_docs, namespace)
+            except Exception as e:
+                logger.error(f"Sparse index upsert failed: {e}")
+                errors.append(f"Sparse index error: {str(e)}")
+
+        return {"indexed": len(sparse_docs), "errors": errors}
+
+    @traced("ingestion.extract_graph")
+    async def step_extract_and_upsert_graph(
+        self,
+        namespace: str,
+        tenant_id: str,
+        chunk_content_hashes: List[str],
+        document_id: str,
+        parsed_artifact_uri: str,
+        artifact_store: "ArtifactStore",
+        ctx: dict,
+        job_id: str = "",
+    ) -> dict:
+        """Build graph nodes/edges, extract entities/relations, deduplicate,
+        and batch-write.
+
+        Entity/relation descriptors are externalised to the artifact store
+        so the step output stays small.  The returned dict contains URIs
+        pointing to the descriptor payloads.
+        """
+        from unified_memory.core.types import (
+            PageNode,
+            PassageNode,
+            EntityNode,
+            GraphEdge,
+            NodeType,
+        )
+        from unified_memory.workflows.serialization import parsed_doc_from_dict
+
+        empty_result: dict = {
+            "graph_node_ids": [],
+            "graph_edge_ids": [],
+            "entity_descriptors": [],
+            "relation_descriptors": [],
+            "errors": [],
+        }
+
+        if not self.graph_store:
+            return empty_result
+
+        errors: List[str] = []
+        nodes_to_create: List[Any] = []
+        edges_to_create: List[Any] = []
+        graph_node_ids: List[str] = []
+
+        doc_dict = await artifact_store.get_json(parsed_artifact_uri)
+        parsed = parsed_doc_from_dict(doc_dict) if doc_dict else None
+        snippet_len = ctx.get("page_snippet_length", 200)
+
+        if parsed:
+            for page in parsed.pages:
+                page_node = PageNode(
+                    id=PageNode.make_id(document_id, page.page_number),
+                    content=page.full_text[:snippet_len],
+                    namespace=namespace,
+                    page_number=page.page_number,
+                    document_id=document_id,
+                    node_type=NodeType.PAGE,
+                )
+                nodes_to_create.append(page_node)
+                graph_node_ids.append(page_node.id)
+
+        extraction_config_dict = ctx.get("extraction_config")
+        extraction_config: Optional[ExtractionConfig] = None
+        if extraction_config_dict:
+            extraction_config = ExtractionConfig(
+                **{
+                    k: v
+                    for k, v in extraction_config_dict.items()
+                    if k in ExtractionConfig.__dataclass_fields__
+                }
+            )
+        extractor = self._resolve_extractor_from_config(extraction_config)
+
+        for idx, content_hash in enumerate(chunk_content_hashes):
+            content = await self.content_store.get_content(content_hash)
+            if not content:
+                continue
+
+            chunk_loc = SourceLocation(
+                document_id=document_id, chunk_index=idx
+            )
+
+            passage_node = PassageNode(
+                id=PassageNode.make_id(tenant_id, content_hash),
+                content="",
+                namespace=namespace,
+                node_type=NodeType.PASSAGE,
+                page_number=None,
+                source_locations=[chunk_loc],
+                properties={"content_hash": content_hash},
+            )
+            nodes_to_create.append(passage_node)
+            graph_node_ids.append(passage_node.id)
+
+            if extractor:
+                chunk_obj = Chunk(
+                    document_id=document_id,
+                    content=content,
+                    chunk_index=idx,
+                    content_hash=content_hash,
+                )
+                extraction_result = await extractor.extract(chunk_obj)
+
+                entities = extraction_result.entities
+                relations = extraction_result.relations
+
+                if (
+                    extraction_config
+                    and extraction_config.strict_type_filtering
+                ):
+                    if extraction_config.entity_types:
+                        entities = [
+                            e
+                            for e in entities
+                            if e.type in extraction_config.entity_types
+                        ]
+                    if extraction_config.relation_types:
+                        relations = [
+                            r
+                            for r in relations
+                            if r.relation_type
+                            in extraction_config.relation_types
+                        ]
+
+                for ent in entities:
+                    entity_id = make_entity_id(ent.name, tenant_id)
+                    node = EntityNode(
+                        id=entity_id,
+                        content=ent.description or "",
+                        namespace=namespace,
+                        entity_name=ent.name,
+                        entity_type=ent.type,
+                        source_locations=[chunk_loc],
+                        properties=ent.properties,
+                        node_type=NodeType.ENTITY,
+                    )
+                    nodes_to_create.append(node)
+                    graph_node_ids.append(node.id)
+                    edges_to_create.append(
+                        GraphEdge(
+                            source_id=passage_node.id,
+                            target_id=node.id,
+                            relation="MENTIONS",
+                            source_locations=[chunk_loc],
+                            namespace=namespace,
+                        )
+                    )
+
+                for rel in relations:
+                    src_id = make_entity_id(rel.source_entity, tenant_id)
+                    tgt_id = make_entity_id(rel.target_entity, tenant_id)
+                    extra_props: Dict[str, Any] = {**rel.properties}
+                    if rel.description:
+                        extra_props["description"] = rel.description
+                    if rel.confidence != 1.0:
+                        extra_props["confidence"] = rel.confidence
+                    if rel.keywords:
+                        extra_props["keywords"] = rel.keywords
+                    if rel.source_type:
+                        extra_props["source_type"] = rel.source_type
+                    if rel.target_type:
+                        extra_props["target_type"] = rel.target_type
+                    edge = GraphEdge(
+                        source_id=src_id,
+                        target_id=tgt_id,
+                        relation=normalize_relation_type(rel.relation_type),
+                        weight=rel.weight,
+                        is_bidirectional=rel.is_bidirectional,
+                        inverse_relation=rel.inverse_relation,
+                        source_locations=[chunk_loc],
+                        namespace=namespace,
+                        properties=extra_props,
+                        source_entity_name=rel.source_entity,
+                        target_entity_name=rel.target_entity,
+                    )
+                    edges_to_create.append(edge)
+
+        # Deduplicate entities (merge provenance)
+        unique_entity_nodes: Dict[str, Any] = {}
+        other_nodes: List[Any] = []
+        for node in nodes_to_create:
+            if (
+                hasattr(node, "node_type")
+                and node.node_type == NodeType.ENTITY
+            ):
+                if node.id not in unique_entity_nodes:
+                    unique_entity_nodes[node.id] = node
+                else:
+                    existing = unique_entity_nodes[node.id]
+                    existing_locs = getattr(existing, "source_locations", [])
+                    new_locs = getattr(node, "source_locations", [])
+                    for loc in new_locs:
+                        if loc not in existing_locs:
+                            existing_locs.append(loc)
+            else:
+                other_nodes.append(node)
+
+        final_nodes = list(unique_entity_nodes.values()) + other_nodes
+
+        # Deduplicate relations (merge provenance and keywords)
+        unique_relations: Dict[tuple, Any] = {}
+        for edge in edges_to_create:
+            key = (edge.source_id, edge.relation, edge.target_id)
+            if key not in unique_relations:
+                unique_relations[key] = edge
+            else:
+                existing = unique_relations[key]
+                existing_locs = getattr(existing, "source_locations", [])
+                new_locs = getattr(edge, "source_locations", [])
+                for loc in new_locs:
+                    if loc not in existing_locs:
+                        existing_locs.append(loc)
+                existing_kw = set(
+                    existing.properties.get("keywords") or []
+                )
+                new_kw = edge.properties.get("keywords") or []
+                if new_kw:
+                    existing_kw.update(new_kw)
+                    existing.properties["keywords"] = list(existing_kw)
+
+        final_edges = list(unique_relations.values())
+
+        try:
+            if final_nodes:
+                await self.graph_store.create_nodes_batch(
+                    final_nodes, namespace
+                )
+            if final_edges:
+                await self.graph_store.create_edges_batch(
+                    final_edges, namespace
+                )
+        except Exception as e:
+            logger.error(f"Batch graph creation failed: {e}")
+            errors.append(f"Graph batch error: {str(e)}")
+
+        graph_edge_ids: List[str] = [edge.id for edge in final_edges]
+
+        entity_descriptors: List[dict] = []
+        for node in unique_entity_nodes.values():
+            locs = getattr(node, "source_locations", [])
+            entity_descriptors.append(
+                {
+                    "id": node.id,
+                    "entity_name": node.entity_name,
+                    "entity_type": node.entity_type,
+                    "description": node.content or "",
+                    "source_locations": [
+                        {
+                            "document_id": loc.document_id,
+                            "chunk_index": loc.chunk_index,
+                        }
+                        for loc in locs
+                    ],
+                }
+            )
+
+        relation_descriptors: List[dict] = []
+        for edge in final_edges:
+            if edge.relation in ("HAS_CHUNK", "MENTIONS"):
+                continue
+            locs = getattr(edge, "source_locations", [])
+            relation_descriptors.append(
+                {
+                    "id": edge.id,
+                    "source_id": edge.source_id,
+                    "target_id": edge.target_id,
+                    "relation": edge.relation,
+                    "source_entity_name": (
+                        getattr(edge, "source_entity_name", "")
+                        or edge.source_id
+                    ),
+                    "target_entity_name": (
+                        getattr(edge, "target_entity_name", "")
+                        or edge.target_id
+                    ),
+                    "description": edge.properties.get("description", ""),
+                    "keywords": edge.properties.get("keywords", []),
+                    "inverse_relation": edge.inverse_relation,
+                    "weight": edge.weight,
+                    "is_bidirectional": edge.is_bidirectional,
+                    "source_locations": [
+                        {
+                            "document_id": loc.document_id,
+                            "chunk_index": loc.chunk_index,
+                        }
+                        for loc in locs
+                    ],
+                }
+            )
+
+        ent_desc_uri = ""
+        rel_desc_uri = ""
+        if artifact_store and job_id:
+            if entity_descriptors:
+                ent_desc_uri = await artifact_store.put_json(
+                    {"descriptors": entity_descriptors},
+                    key=f"jobs/{job_id}/graph/{document_id}_entities.json",
+                )
+            if relation_descriptors:
+                rel_desc_uri = await artifact_store.put_json(
+                    {"descriptors": relation_descriptors},
+                    key=f"jobs/{job_id}/graph/{document_id}_relations.json",
+                )
+
+        result: dict = {
+            "graph_node_ids": graph_node_ids,
+            "graph_edge_ids": graph_edge_ids,
+            "entity_count": len(entity_descriptors),
+            "relation_count": len(relation_descriptors),
+            "errors": errors,
+        }
+
+        if ent_desc_uri:
+            result["entity_descriptors_uri"] = ent_desc_uri
+        else:
+            result["entity_descriptors"] = entity_descriptors
+
+        if rel_desc_uri:
+            result["relation_descriptors_uri"] = rel_desc_uri
+        else:
+            result["relation_descriptors"] = relation_descriptors
+
+        return result
+
+    @traced("ingestion.embed_entities_relations")
+    async def step_embed_and_upsert_entities_relations(
+        self,
+        namespace: str,
+        tenant_id: str,
+        document_id: str,
+        entity_descriptors: Optional[List[dict]] = None,
+        relation_descriptors: Optional[List[dict]] = None,
+        ctx: Optional[dict] = None,
+        artifact_store: "ArtifactStore" = None,
+        entity_descriptors_uri: str = "",
+        relation_descriptors_uri: str = "",
+    ) -> dict:
+        """Embed entity and relation descriptions and upsert to vector store.
+
+        Descriptors can be passed inline *or* as artifact store URIs.
+        When URIs are provided, the descriptors are loaded from the store.
+        """
+        from unified_memory.core.types import Entity as _EntityType
+
+        if entity_descriptors_uri and artifact_store:
+            data = await artifact_store.get_json(entity_descriptors_uri)
+            entity_descriptors = data.get("descriptors", []) if data else []
+        entity_descriptors = entity_descriptors or []
+
+        if relation_descriptors_uri and artifact_store:
+            data = await artifact_store.get_json(relation_descriptors_uri)
+            relation_descriptors = data.get("descriptors", []) if data else []
+        relation_descriptors = relation_descriptors or []
+
+        errors: List[str] = []
+        entity_vector_ids: List[str] = []
+        relation_vector_ids: List[str] = []
+
+        ctx = ctx or {}
+        tc_dict = ctx.get("tenant_config", {})
+        tenant_config = TenantConfig(**{
+            k: v for k, v in tc_dict.items()
+            if k in TenantConfig.__dataclass_fields__
+        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        embedder = self._resolve_embedder_from_tenant(tenant_config)
+
+        if entity_descriptors:
+            entity_collection = (
+                await self.namespace_manager.get_collection_name(
+                    namespace, CollectionType.ENTITIES
+                )
+            )
+
+            ent_contents: List[str] = []
+            for ed in entity_descriptors:
+                tmp_entity = _EntityType(
+                    name=ed["entity_name"],
+                    entity_type=ed["entity_type"],
+                    description=ed.get("description", ""),
+                )
+                ent_contents.append(tmp_entity.get_embedding_text())
+
+            try:
+                ent_embeddings = await embedder.embed_batch(
+                    ent_contents, modality=Modality.TEXT
+                )
+
+                ent_vector_data: List[Dict[str, Any]] = []
+                for ed, emb in zip(entity_descriptors, ent_embeddings):
+                    provenance_doc_ids = list(
+                        {
+                            loc["document_id"]
+                            for loc in ed.get("source_locations", [])
+                        }
+                    )
+                    ent_vector_data.append(
+                        {
+                            "id": ed["id"],
+                            "embedding": emb,
+                            "metadata": {
+                                "entity_name": ed["entity_name"],
+                                "entity_type": ed["entity_type"],
+                                "content_hash": compute_content_hash(
+                                    ed.get("description")
+                                    or ed["entity_name"],
+                                    tenant_id,
+                                    Modality.TEXT,
+                                ),
+                                "document_id": document_id,
+                                "source_doc_ids": provenance_doc_ids,
+                                "source_locations": ed.get(
+                                    "source_locations", []
+                                ),
+                            },
+                        }
+                    )
+
+                await self.vector_store.upsert(
+                    ent_vector_data, namespace, collection=entity_collection
+                )
+                entity_vector_ids = [v["id"] for v in ent_vector_data]
+            except Exception as e:
+                logger.error(f"Entity embedding/storage failed: {e}")
+                errors.append(f"Entity semantic index error: {str(e)}")
+
+        if relation_descriptors:
+            rel_collection = (
+                await self.namespace_manager.get_collection_name(
+                    namespace, CollectionType.RELATIONS
+                )
+            )
+
+            rel_texts: List[str] = []
+            for rd in relation_descriptors:
+                tmp_rel = Relation(
+                    subject_id=rd["source_id"],
+                    predicate=rd["relation"],
+                    object_id=rd["target_id"],
+                    subject=(
+                        rd.get("source_entity_name", "") or rd["source_id"]
+                    ),
+                    object=(
+                        rd.get("target_entity_name", "") or rd["target_id"]
+                    ),
+                    description=rd.get("description", ""),
+                    keywords=rd.get("keywords", []),
+                    inverse_relation=rd.get("inverse_relation"),
+                )
+                rel_texts.append(tmp_rel.get_embedding_text())
+
+            try:
+                rel_embeddings = await embedder.embed_batch(
+                    rel_texts, modality=Modality.TEXT
+                )
+
+                rel_vector_data: List[Dict[str, Any]] = []
+                for rd, emb, text in zip(
+                    relation_descriptors, rel_embeddings, rel_texts
+                ):
+                    provenance_doc_ids = list(
+                        {
+                            loc["document_id"]
+                            for loc in rd.get("source_locations", [])
+                        }
+                    )
+                    rel_vector_data.append(
+                        {
+                            "id": rd["id"],
+                            "embedding": emb,
+                            "metadata": {
+                                "source_id": rd["source_id"],
+                                "target_id": rd["target_id"],
+                                "relation": rd["relation"],
+                                "content_hash": compute_content_hash(
+                                    text, tenant_id, Modality.TEXT
+                                ),
+                                "text": text,
+                                "document_id": document_id,
+                                "source_doc_ids": provenance_doc_ids,
+                                "source_locations": rd.get(
+                                    "source_locations", []
+                                ),
+                            },
+                        }
+                    )
+
+                await self.vector_store.upsert(
+                    rel_vector_data, namespace, collection=rel_collection
+                )
+                relation_vector_ids = [v["id"] for v in rel_vector_data]
+            except Exception as e:
+                logger.error(f"Relation embedding failed: {e}")
+                errors.append(f"Relation embedding error: {str(e)}")
+
+        return {
+            "entity_vector_ids": entity_vector_ids,
+            "relation_vector_ids": relation_vector_ids,
+            "errors": errors,
+        }
+
+    @traced("ingestion.embed_vision")
+    async def step_embed_and_upsert_vision(
+        self,
+        namespace: str,
+        tenant_id: str,
+        document_id: str,
+        page_image_uris: List[dict],
+        artifact_store: "ArtifactStore",
+        ctx: dict,
+    ) -> dict:
+        """Embed page images and upsert to the vision vector collection.
+
+        ``page_image_uris`` is a list of dicts with ``page_number`` and
+        ``uri`` keys produced by ``step_parse_and_externalize``.
+        Images are loaded from the artifact store by URI.
+
+        Vector IDs are content-addressable and model-aware via
+        ``compute_vector_id(image_hash, vision_model, "image")``.
+
+        When an ``image_content_store`` is available on ``self``, images
+        are persisted there for later retrieval; otherwise they remain
+        only in the ephemeral artifact store.
+        """
+        import hashlib
+        from unified_memory.core.types import compute_vector_id
+
+        errors: List[str] = []
+        page_image_vector_ids: List[str] = []
+
+        if not ctx.get("enable_visual") or not page_image_uris:
+            return {"page_image_vector_ids": [], "errors": []}
+
+        vision_model = ctx.get("vision_embedding_model", "")
+
+        tc_dict = ctx.get("tenant_config", {})
+        tenant_config = TenantConfig(**{
+            k: v for k, v in tc_dict.items()
+            if k in TenantConfig.__dataclass_fields__
+        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        vision_embedder = self._resolve_vision_embedder_from_tenant(
+            tenant_config
+        )
+
+        if not vision_embedder:
+            return {"page_image_vector_ids": [], "errors": []}
+
+        try:
+            vision_collection = (
+                await self.namespace_manager.get_collection_name(
+                    namespace, CollectionType.PAGE_IMAGES
+                )
+            )
+
+            images: List[bytes] = []
+            page_numbers: List[int] = []
+            for entry in page_image_uris:
+                img_bytes = await artifact_store.get_bytes(entry["uri"])
+                if img_bytes:
+                    images.append(img_bytes)
+                    page_numbers.append(entry["page_number"])
+
+            if images:
+                vision_embeddings = await vision_embedder.embed_batch(
+                    images, modality=Modality.IMAGE
+                )
+
+                vision_vectors: List[Dict[str, Any]] = []
+                for page_num, img_bytes, emb in zip(
+                    page_numbers, images, vision_embeddings
+                ):
+                    raw_hash = hashlib.sha256(img_bytes).hexdigest()
+                    img_content_hash = compute_content_hash(
+                        raw_hash, tenant_id, Modality.IMAGE
+                    )
+                    vector_id = compute_vector_id(
+                        img_content_hash, vision_model or "default", "image"
+                    )
+
+                    if getattr(self, "image_content_store", None):
+                        await self.image_content_store.store_image(
+                            img_content_hash, img_bytes
+                        )
+                        await self.cas_registry.register(
+                            content_hash=img_content_hash,
+                            content_id=img_content_hash,
+                            vector_id=vector_id,
+                        )
+                        await self.cas_registry.add_reference(
+                            content_hash=img_content_hash,
+                            namespace=namespace,
+                            document_id=document_id,
+                            chunk_index=page_num,
+                        )
+
+                    vision_vectors.append(
+                        {
+                            "id": vector_id,
+                            "embedding": emb,
+                            "metadata": {
+                                "document_id": document_id,
+                                "page_number": page_num,
+                                "content_hash": img_content_hash,
+                                "source_locations": [
+                                    {
+                                        "document_id": document_id,
+                                        "chunk_index": page_num,
+                                    }
+                                ],
+                            },
+                        }
+                    )
+
+                await self.vector_store.upsert(
+                    vision_vectors, namespace, collection=vision_collection
+                )
+                page_image_vector_ids = [
+                    v["id"] for v in vision_vectors
+                ]
+        except Exception as e:
+            logger.error(f"Vision embedding failed: {e}")
+            errors.append(f"Vision embedding error: {str(e)}")
+
+        return {
+            "page_image_vector_ids": page_image_vector_ids,
+            "errors": errors,
+        }
+
+    @traced("ingestion.finalize")
+    async def step_finalize_registry(
+        self,
+        tenant_id: str,
+        doc_hash: str,
+        text_result: dict,
+        graph_result: dict,
+        ent_rel_result: dict,
+        vision_result: dict,
+        chunk_content_hashes: List[str],
+    ) -> None:
+        """Persist all accumulated IDs to the document registry."""
+        await self.document_registry.add_ids(
+            tenant_id,
+            doc_hash,
+            text_vector_ids=text_result.get("text_vector_ids", []),
+            entity_vector_ids=ent_rel_result.get("entity_vector_ids", []),
+            relation_vector_ids=ent_rel_result.get(
+                "relation_vector_ids", []
+            ),
+            page_image_vector_ids=vision_result.get(
+                "page_image_vector_ids", []
+            ),
+            graph_node_ids=graph_result.get("graph_node_ids", []),
+            graph_edge_ids=graph_result.get("graph_edge_ids", []),
+            chunk_content_hashes=chunk_content_hashes,
+        )
 
     async def _process_chunks(
         self,
@@ -700,29 +1945,52 @@ class IngestionPipeline:
                     )
                     
                     vision_vectors: List[Dict[str, Any]] = []
+                    import hashlib
+                    from unified_memory.core.types import compute_vector_id
+
+                    vision_model_name = (
+                        tenant_config.vision_embedding.model
+                        if tenant_config and tenant_config.vision_embedding
+                        else "default"
+                    )
                     for page, emb in zip(pages_with_images, vision_embeddings):
-                        # Use hash of image bytes for deterministic ID? 
-                        # Or page ID: "page:{doc_id}:{page_num}:image"
-                        # To be safe and deterministic based on content:
-                        # But image bytes are large.
-                        # Let's use page ID for now as primary key, but content hash for dedup logic if needed.
-                        # For now, just store it.
-                        
-                        # We need a string representation for compute_content_hash
-                        # Using hashlib on bytes directly is better, but compute_content_hash takes str.
-                        # We'll use a placeholder or hash of bytes as str.
-                        import hashlib
-                        img_hash = hashlib.sha256(page.full_page_image).hexdigest()
-                        
-                        vector_id = f"image:{parsed_document.document_id}:{page.page_number}"
-                        
+                        raw_hash = hashlib.sha256(page.full_page_image).hexdigest()
+                        img_content_hash = compute_content_hash(
+                            raw_hash, tenant_id, Modality.IMAGE
+                        )
+                        vector_id = compute_vector_id(
+                            img_content_hash, vision_model_name, "image"
+                        )
+
+                        if getattr(self, "image_content_store", None):
+                            await self.image_content_store.store_image(
+                                img_content_hash, page.full_page_image
+                            )
+                            await self.cas_registry.register(
+                                content_hash=img_content_hash,
+                                content_id=img_content_hash,
+                                vector_id=vector_id,
+                            )
+                            await self.cas_registry.add_reference(
+                                content_hash=img_content_hash,
+                                namespace=namespace,
+                                document_id=parsed_document.document_id,
+                                chunk_index=page.page_number,
+                            )
+
                         vision_vectors.append({
                             "id": vector_id,
                             "embedding": emb,
                             "metadata": {
                                 "document_id": parsed_document.document_id,
                                 "page_number": page.page_number,
-                                "content_hash": img_hash,
+                                "content_hash": img_content_hash,
+                                "source_locations": [
+                                    {
+                                        "document_id": parsed_document.document_id,
+                                        "chunk_index": page.page_number,
+                                    }
+                                ],
                             }
                         })
                     
@@ -887,6 +2155,7 @@ class IngestionPipeline:
             chunk_hashes,
         )
 
+    @traced("ingestion.file")
     async def ingest_file(
         self,
         path: Path,
@@ -961,6 +2230,7 @@ class IngestionPipeline:
                         ],
                         page_count=parsed.page_count,
                         deduped=True,
+                        doc_hash=doc_hash,
                     )
 
                 # PATH B: Fast link
@@ -1024,13 +2294,19 @@ class IngestionPipeline:
                     for i, content_hash in enumerate(existing_doc.chunk_content_hashes)
                 ]
                 
+                # Update namespace-docs index
+                await self.document_registry.add_doc_to_namespace_index(
+                    namespace, doc_hash, existing_doc.document_id
+                )
+
                 return IngestionResult(
                     document_id=existing_doc.document_id,
                     source=source_ref,
                     chunk_count=len(chunks_for_result),
                     chunks=chunks_for_result,
                     page_count=parsed.page_count,
-                    deduped=True
+                    deduped=True,
+                    doc_hash=doc_hash,
                 )
             
             # PATH A: Full Ingestion
@@ -1079,6 +2355,11 @@ class IngestionPipeline:
                 chunk_content_hashes=chunk_hashes,
             )
 
+            # Update namespace-docs index
+            await self.document_registry.add_doc_to_namespace_index(
+                namespace, doc_hash, doc_id
+            )
+
             return IngestionResult(
                 document_id=doc_id,
                 source=source_ref,
@@ -1086,12 +2367,14 @@ class IngestionPipeline:
                 page_count=parsed.page_count,
                 chunks=chunks,
                 errors=parsed.parse_errors + processing_errors,
-                deduped=False
+                deduped=False,
+                doc_hash=doc_hash,
             )
         except Exception as e:
             logger.exception(f"Error ingesting file: {path}")
             return IngestionResult(doc_id, source_ref, errors=[str(e)])
 
+    @traced("ingestion.text")
     async def ingest_text(
         self,
         text: str,
@@ -1156,6 +2439,7 @@ class IngestionPipeline:
                         chunks=chunks_for_result,
                         page_count=1,
                         deduped=True,
+                        doc_hash=doc_hash,
                     )
 
             if existing_doc:
@@ -1219,6 +2503,11 @@ class IngestionPipeline:
                     for i, vid in enumerate(text_vec_ids)
                 ]
 
+                # Update namespace-docs index
+                await self.document_registry.add_doc_to_namespace_index(
+                    namespace, doc_hash, existing_doc.document_id
+                )
+
                 return IngestionResult(
                     document_id=existing_doc.document_id,
                     source=source_ref,
@@ -1226,6 +2515,7 @@ class IngestionPipeline:
                     chunks=chunks_for_result,
                     page_count=1,
                     deduped=True,
+                    doc_hash=doc_hash,
                 )
             
             # PATH A: Full Ingestion
@@ -1272,6 +2562,11 @@ class IngestionPipeline:
                 chunk_content_hashes=chunk_hashes,
             )
             
+            # Update namespace-docs index
+            await self.document_registry.add_doc_to_namespace_index(
+                namespace, doc_hash, doc_id
+            )
+
             return IngestionResult(
                 document_id=doc_id,
                 source=source_ref,
@@ -1279,29 +2574,104 @@ class IngestionPipeline:
                 page_count=1,
                 chunks=chunks,
                 errors=processing_errors,
-                deduped=False
+                deduped=False,
+                doc_hash=doc_hash,
             )
         except Exception as e:
             logger.exception(f"Error ingesting text: {doc_id}")
             return IngestionResult(doc_id, source_ref, errors=[str(e)])
 
+    async def _namespace_still_needed(
+        self,
+        remaining_doc_ids: List[str],
+        namespace: str,
+    ) -> bool:
+        """Return ``True`` if any of *remaining_doc_ids* still belongs to
+        *namespace* according to the ``DocumentRegistry``.
+
+        This is the check that prevents shared vectors from being
+        prematurely removed when one of several contributing documents
+        is deleted.
+        """
+        for doc_id in remaining_doc_ids:
+            doc_entry = await self.document_registry.get_document_by_document_id(
+                doc_id
+            )
+            if doc_entry and namespace in doc_entry.namespaces:
+                return True
+        return False
+
+    async def _remove_vector_smart(
+        self,
+        vid: str,
+        namespace: str,
+        document_id: str,
+        collection: str,
+        result: DeleteResult,
+    ) -> None:
+        """Two-step vector removal: dissociate the document, then
+        conditionally remove the namespace."""
+        remaining = await self.vector_store.remove_document_reference(
+            vid, document_id, collection=collection
+        )
+        if remaining and await self._namespace_still_needed(remaining, namespace):
+            result.vectors_unlinked += 1
+            return
+
+        success, was_last = await self.vector_store.remove_namespace(
+            vid, namespace, collection=collection
+        )
+        if not success:
+            return
+        if was_last:
+            result.vectors_deleted += 1
+        else:
+            result.vectors_unlinked += 1
+
+    async def _remove_graph_smart(
+        self,
+        gid: str,
+        namespace: str,
+        document_id: str,
+        result: DeleteResult,
+        is_node: bool = True,
+    ) -> None:
+        """Two-step graph element removal."""
+        remaining = await self.graph_store.remove_document_reference(
+            gid, document_id
+        )
+        if remaining and await self._namespace_still_needed(remaining, namespace):
+            if is_node:
+                result.nodes_unlinked += 1
+            return
+
+        success, was_last = await self.graph_store.remove_namespace(gid, namespace)
+        if not success:
+            return
+        if was_last:
+            result.nodes_deleted += 1
+        else:
+            result.nodes_unlinked += 1
+
+    @traced("ingestion.delete")
     async def delete_document(
         self,
         tenant_id: str,
         document_hash: str,
         namespace: str,
     ) -> DeleteResult:
-        """
-        Ref-count-aware delete for a document in a given namespace.
+        """Ref-count-aware delete for a document in a given namespace.
 
-        This method:
-        - Removes the namespace from DocumentRegistry entry (and deletes the entry
-          entirely if it was the last namespace).
-        - Removes the namespace from all associated vectors and graph nodes/edges.
-        - Hard-deletes vectors/nodes/edges only when no namespaces remain.
+        For each vector / graph element the method first removes the
+        document's metadata (``source_doc_ids``, ``source_locations``).
+        It then checks, via ``DocumentRegistry``, whether any of the
+        *remaining* documents still use this namespace.  Only when the
+        namespace is no longer needed does it actually remove the
+        namespace from the element (and hard-delete if it was the last).
 
-        NOTE: CAS / ContentStore cleanup is intentionally conservative for now and
-        can be extended once end-to-end ref-count semantics are fully wired.
+        This prevents shared vectors from being prematurely deleted
+        when two documents contribute the same chunk to the same
+        namespace.
         """
 
         # Lookup document entry
@@ -1314,92 +2684,95 @@ class IngestionPipeline:
 
         result = DeleteResult(found=True)
 
-        # Vector store clean-up per collection
-        # TEXT
+        # --- Vector store clean-up per collection ---
+
         if entry.text_vector_ids:
-            text_collection = await self.namespace_manager.get_collection_name(
+            text_col = await self.namespace_manager.get_collection_name(
                 namespace, CollectionType.TEXTS
             )
             for vid in entry.text_vector_ids:
-                success, was_last = await self.vector_store.remove_namespace(
-                    vid, namespace, collection=text_collection, document_id=entry.document_id
+                await self._remove_vector_smart(
+                    vid, namespace, entry.document_id, text_col, result
                 )
-                if not success:
-                    continue
-                if was_last:
-                    result.vectors_deleted += 1
-                else:
-                    result.vectors_unlinked += 1
 
         # ENTITIES
         if entry.entity_vector_ids:
-            ent_collection = await self.namespace_manager.get_collection_name(
+            ent_col = await self.namespace_manager.get_collection_name(
                 namespace, CollectionType.ENTITIES
             )
             for vid in entry.entity_vector_ids:
-                success, was_last = await self.vector_store.remove_namespace(
-                    vid, namespace, collection=ent_collection, document_id=entry.document_id
+                await self._remove_vector_smart(
+                    vid, namespace, entry.document_id, ent_col, result
                 )
-                if not success:
-                    continue
-                if was_last:
-                    result.vectors_deleted += 1
-                else:
-                    result.vectors_unlinked += 1
 
         # RELATIONS
         if entry.relation_vector_ids:
-            rel_collection = await self.namespace_manager.get_collection_name(
+            rel_col = await self.namespace_manager.get_collection_name(
                 namespace, CollectionType.RELATIONS
             )
             for vid in entry.relation_vector_ids:
-                success, was_last = await self.vector_store.remove_namespace(
-                    vid, namespace, collection=rel_collection, document_id=entry.document_id
+                await self._remove_vector_smart(
+                    vid, namespace, entry.document_id, rel_col, result
                 )
-                if not success:
-                    continue
-                if was_last:
-                    result.vectors_deleted += 1
-                else:
-                    result.vectors_unlinked += 1
 
-        # PAGE IMAGES
+        # PAGE IMAGES — image CAS cleanup first (needs vector metadata), then vector removal
         if entry.page_image_vector_ids:
-            page_collection = await self.namespace_manager.get_collection_name(
+            page_col = await self.namespace_manager.get_collection_name(
                 namespace, CollectionType.PAGE_IMAGES
             )
+            if getattr(self, "image_content_store", None):
+                for vid in entry.page_image_vector_ids:
+                    try:
+                        vec = await self.vector_store.get_by_id(
+                            vid, collection=page_col, namespace=namespace
+                        )
+                        if not vec:
+                            continue
+                        img_content_hash = vec.metadata.get("content_hash")
+                        if not img_content_hash:
+                            continue
+                        await self.cas_registry.remove_reference(
+                            content_hash=img_content_hash,
+                            namespace=namespace,
+                            document_id=entry.document_id,
+                            chunk_index=None,
+                        )
+                        remaining = await self.cas_registry.get_entry(
+                            img_content_hash
+                        )
+                        if not remaining or remaining.refs:
+                            continue
+                        await self.image_content_store.delete_image(
+                            img_content_hash
+                        )
+                        await self.cas_registry.delete_if_orphan(
+                            img_content_hash
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Error during image CAS cleanup for vector %s",
+                            vid,
+                        )
             for vid in entry.page_image_vector_ids:
-                success, was_last = await self.vector_store.remove_namespace(
-                    vid, namespace, collection=page_collection, document_id=entry.document_id
+                await self._remove_vector_smart(
+                    vid, namespace, entry.document_id, page_col, result
                 )
-                if not success:
-                    continue
-                if was_last:
-                    result.vectors_deleted += 1
-                else:
-                    result.vectors_unlinked += 1
 
-        # Graph clean-up (nodes + edges) if graph store enabled
+        # --- Graph clean-up ---
+
         if self.graph_store:
             # Nodes
             for nid in entry.graph_node_ids:
-                success, was_last = await self.graph_store.remove_namespace(nid, namespace)
-                if not success:
-                    continue
-                if was_last:
-                    result.nodes_deleted += 1
-                else:
-                    result.nodes_unlinked += 1
-
+                await self._remove_graph_smart(
+                    nid, namespace, entry.document_id, result, is_node=True
+                )
             # Edges
             for eid in entry.graph_edge_ids:
-                success, was_last = await self.graph_store.remove_namespace(eid, namespace)
-                if not success:
-                    continue
-                if was_last:
-                    result.nodes_deleted += 1
-                else:
-                    result.nodes_unlinked += 1
+                await self._remove_graph_smart(
+                    eid, namespace, entry.document_id, result, is_node=False
+                )
+
+        # --- CAS / ContentStore clean-up ---
 
         # CAS / ContentStore clean-up using chunk content hashes.
         # We conservatively remove this namespace's references for the document_id
@@ -1425,23 +2798,42 @@ class IngestionPipeline:
                     await self.content_store.delete_content(cas_entry.content_id)
                 except Exception:
                     logger.exception(
-                        "Failed to delete content for orphaned hash %s", content_hash
+                        "Failed to delete content for orphaned hash %s",
+                        content_hash,
                     )
 
                 await self.cas_registry.delete_if_orphan(content_hash)
             except Exception:
                 logger.exception(
-                    "Error during CAS/content cleanup for hash %s", content_hash
+                    "Error during CAS/content cleanup for hash %s",
+                    content_hash,
                 )
- 
-        # 7. Sparse store clean-up
+
+        # --- Sparse store clean-up ---
+
         if self.sparse_store and entry.chunk_content_hashes:
             try:
-                await self.sparse_store.delete(
-                    doc_ids=entry.chunk_content_hashes,
-                    namespace=namespace,
-                    document_id=entry.document_id
-                )
+                if hasattr(self.sparse_store, "remove_document_reference"):
+                    remaining_map = await self.sparse_store.remove_document_reference(
+                        doc_ids=entry.chunk_content_hashes,
+                        namespace=namespace,
+                        document_id=entry.document_id,
+                    )
+                    hashes_to_delete = [
+                        h for h, docs in remaining_map.items()
+                        if not docs or not await self._namespace_still_needed(docs, namespace)
+                    ]
+                    if hashes_to_delete:
+                        await self.sparse_store.delete(
+                            doc_ids=hashes_to_delete,
+                            namespace=namespace,
+                        )
+                else:
+                    await self.sparse_store.delete(
+                        doc_ids=entry.chunk_content_hashes,
+                        namespace=namespace,
+                        document_id=entry.document_id,
+                    )
             except Exception as e:
                 logger.error(f"Sparse index delete failed: {e}")
 

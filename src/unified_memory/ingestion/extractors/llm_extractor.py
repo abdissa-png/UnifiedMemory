@@ -108,10 +108,6 @@ class LLMExtractor(Extractor):
 
     @staticmethod
     def _parse_json(raw: str) -> Dict[str, Any]:
-        """Best-effort JSON parsing — strips markdown fences if present."""
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            text = "\n".join(lines)
-        return json.loads(text)
+        """Robust JSON parsing using json-repair."""
+        from unified_memory.core.json_utils import validate_and_repair_json
+        return validate_and_repair_json(raw, expected_keys=["entities", "relations"])
