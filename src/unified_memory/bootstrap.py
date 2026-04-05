@@ -12,6 +12,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Optional
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from unified_memory.ingestion.pipeline import IngestionPipeline
 from unified_memory.retrieval.unified import UnifiedSearchService
 from unified_memory.retrieval.dense import DenseRetriever
 from unified_memory.retrieval.graph import GraphRetriever
+from unified_memory.namespace.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +84,16 @@ class SystemContext:
 
         self._register_providers(config)
 
+        self.tenant_manager = TenantManager(self.kv_store)
+
         self.ingestion_pipeline: Optional[IngestionPipeline] = None
         self.search_service: Optional[UnifiedSearchService] = None
+        self.qa_agent = None
+
+        # Set by API lifespan when SQL is configured
+        self.sql_session_factory = None
+        self.chat_session_manager = None
+        self.audit_logger = None
 
     # ------------------------------------------------------------------
     # Alternate constructors / hot reload
@@ -156,10 +166,23 @@ class SystemContext:
         *,
         default_text_embedding_key: Optional[str] = None,
         default_vision_embedding_key: Optional[str] = None,
+        enable_inngest: bool = False,
+        artifact_store_dir: Optional[str] = None,
     ) -> "SystemContext":
         """Build the ingestion pipeline and search service.
 
         Call after registering all providers.
+
+        Parameters
+        ----------
+        enable_inngest : bool
+            When *True*, create the Inngest client, artifact store, and
+            durable workflow functions.  The functions are accessible via
+            ``self.inngest_functions`` for registration with the serve
+            handler.
+        artifact_store_dir : str | None
+            Base directory for the local-FS artifact store.  Defaults to
+            ``/tmp/memory_artifacts``.
         """
         default_text_embedder = None
         default_vision_embedder = None
@@ -192,6 +215,19 @@ class SystemContext:
         )
 
 
+        from unified_memory.workflows.artifact_store import LocalFSArtifactStore
+        from unified_memory.cas.image_content_store import LocalFSImageContentStore
+        from unified_memory.cas.document_content_store import LocalFSDocumentContentStore
+
+        _base = artifact_store_dir or "/tmp/memory_artifacts"
+        self._artifact_store = LocalFSArtifactStore(base_dir=_base)
+        self._image_content_store = LocalFSImageContentStore(
+            base_dir=os.path.join(_base, "images")
+        )
+        self._document_content_store = LocalFSDocumentContentStore(
+            base_dir=os.path.join(_base, "documents")
+        )
+
         self.ingestion_pipeline = IngestionPipeline(
             vector_store=self.vector_store,
             graph_store=self.graph_store,
@@ -203,6 +239,9 @@ class SystemContext:
             provider_registry=self.provider_registry,
             embedding_provider=default_text_embedder,
             vision_embedding_provider=default_vision_embedder,
+            artifact_store=self._artifact_store,
+            image_content_store=self._image_content_store,
+            document_content_store=self._document_content_store,
         )
 
         self.search_service = UnifiedSearchService(
@@ -216,7 +255,78 @@ class SystemContext:
             dense_retriever=dense_retriever,
             graph_retriever=graph_retriever,
         )
+
+        if enable_inngest:
+            self._setup_inngest()
+
+        # Build QA agent if an LLM provider is available
+        self._setup_qa_agent()
+
         return self
+
+    def _setup_qa_agent(self) -> None:
+        """Wire QA agent dynamically using the provider registry and namespace manager."""
+        from unified_memory.agents.qa_agent import QAAgent
+
+        if self.search_service and self.namespace_manager and self.provider_registry:
+            self.qa_agent = QAAgent(
+                search_service=self.search_service,
+                namespace_manager=self.namespace_manager,
+                provider_registry=self.provider_registry,
+                session_manager=self.chat_session_manager,
+            )
+            logger.info("QA agent initialised")
+
+    # ------------------------------------------------------------------
+    # Inngest / workflow setup
+    # ------------------------------------------------------------------
+
+    def _setup_inngest(self) -> None:
+        """Wire up Inngest client and workflow functions.
+
+        The artifact store is already created in ``build_services``.
+        """
+        from unified_memory.workflows.client import get_inngest_client
+        from unified_memory.workflows.ingest_function import create_ingest_function
+        from unified_memory.workflows.delete_function import create_delete_function
+
+        self._inngest_client = get_inngest_client()
+
+        self._inngest_ingest_fn = create_ingest_function(
+            self.ingestion_pipeline, self._artifact_store,
+        )
+        self._inngest_delete_fn = create_delete_function(
+            self.ingestion_pipeline,
+        )
+        self._inngest_functions = [
+            self._inngest_ingest_fn,
+            self._inngest_delete_fn,
+        ]
+
+    @property
+    def inngest_client(self):
+        """Inngest client instance (raises if not enabled)."""
+        return getattr(self, "_inngest_client", None)
+
+    @property
+    def inngest_functions(self):
+        """List of Inngest functions to register with the serve handler."""
+        return getattr(self, "_inngest_functions", [])
+
+    @property
+    def artifact_store(self):
+        """Artifact store for externalising large payloads."""
+        return getattr(self, "_artifact_store", None)
+
+    @property
+    def image_content_store(self):
+        """Persistent image store for vision retrieval."""
+        return getattr(self, "_image_content_store", None)
+
+    @property
+    def document_content_store(self):
+        """Persistent store for original uploaded documents."""
+        return getattr(self, "_document_content_store", None)
 
     # ------------------------------------------------------------------
     # Infrastructure builders
@@ -303,12 +413,13 @@ class SystemContext:
             else:
                 self.provider_registry.register_embedding_provider(key, provider)
 
-        # LLM providers (stored in registry for extractor use)
+        # LLM providers (stored in registry for extractor use + QA agent)
         llm_instances: Dict[str, Any] = {}
         for key, llm_cfg in config.get("llm_providers", {}).items():
             llm = self._build_llm_provider(llm_cfg)
             if llm:
                 llm_instances[key] = llm
+                self.provider_registry.register_llm_provider(key, llm)
 
         # Extractors
         for key, ext_cfg in config.get("extractors", {}).items():
