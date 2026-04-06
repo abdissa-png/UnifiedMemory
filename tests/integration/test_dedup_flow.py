@@ -17,6 +17,7 @@ async def test_two_user_dedup_flow(ingestion_pipeline, namespace_manager, tenant
     tenant_id = "tenant_dedup"
     config = await tenant_manager.register_tenant(
         tenant_id,
+        admin_user_id="admin-123",
         text_embedding=EmbeddingModelConfig(
             provider="mock", model="mock:mock-model", dimension=128
         ),

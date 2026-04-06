@@ -1,6 +1,6 @@
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from unified_memory.retrieval.rerankers.models import CohereReranker, BGEReranker
 from unified_memory.core.types import RetrievalResult
 
@@ -13,28 +13,28 @@ def sample_results():
 
 @pytest.mark.asyncio
 async def test_cohere_reranker(sample_results):
-    # Mock cohere in sys.modules to avoid ImportError if not installed
+    mock_response = MagicMock()
+    mock_result_item0 = MagicMock()
+    mock_result_item0.index = 1  # Banana
+    mock_result_item0.relevance_score = 0.9
+
+    mock_result_item1 = MagicMock()
+    mock_result_item1.index = 0  # Apple
+    mock_result_item1.relevance_score = 0.1
+
+    mock_response.results = [mock_result_item0, mock_result_item1]
+    mock_response.meta = None
+
+    mock_async_client = AsyncMock()
+    mock_async_client.rerank.return_value = mock_response
+
     with patch.dict('sys.modules', {'cohere': MagicMock()}):
-        with patch("cohere.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value
-            # Mock rerank response
-            mock_response = MagicMock()
-            mock_result_item0 = MagicMock()
-            mock_result_item0.index = 1 # Banana
-            mock_result_item0.relevance_score = 0.9
-            
-            mock_result_item1 = MagicMock()
-            mock_result_item1.index = 0 # Apple
-            mock_result_item1.relevance_score = 0.1
-            
-            mock_response.results = [mock_result_item0, mock_result_item1]
-            mock_client.rerank.return_value = mock_response
-            
+        with patch("cohere.AsyncClient", return_value=mock_async_client):
             reranker = CohereReranker(api_key="fake")
             reranked = await reranker.rerank("fruit", sample_results)
-            
+
             assert len(reranked) == 2
-            assert reranked[0].id == "2" # Banana first
+            assert reranked[0].id == "2"  # Banana first
             assert reranked[0].score == 0.9
             assert reranked[1].id == "1"
 

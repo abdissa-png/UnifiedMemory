@@ -21,7 +21,7 @@ async def test_register_and_get(manager):
         model="my-text-model",
         dimension=1536,
     )
-    await manager.register_tenant(tenant_id, text_embedding=text_cfg)
+    await manager.register_tenant(tenant_id, admin_user_id="admin-123", text_embedding=text_cfg)
     
     config = await manager.get_tenant_config(tenant_id)
     assert config is not None
@@ -42,7 +42,7 @@ async def test_get_embedding_model_id(manager):
         model="custom-model-v1",
         dimension=1536,
     )
-    await manager.register_tenant(tenant_id, text_embedding=text_cfg)
+    await manager.register_tenant(tenant_id, admin_user_id="admin-456", text_embedding=text_cfg)
     
     model_id = await manager.get_embedding_model_id(tenant_id, Modality.TEXT)
     assert model_id == "custom-model-v1"

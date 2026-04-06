@@ -285,7 +285,7 @@ async def test_vision_embedding(pipeline, tenant_manager, mock_deps):
     ns_id = "tenant:vision/user:test"
     ns_cfg = NamespaceConfig(tenant_id="vision", user_id="test")
     await mock_deps["kv"].set(f"ns_config:{ns_id}", asdict(ns_cfg))
-    await tenant_manager.register_tenant("vision", vision_embedding=mock_deps["vision_embedding_provider"])
+    await tenant_manager.register_tenant("vision",admin_user_id="admin-123", vision_embedding=mock_deps["vision_embedding_provider"])
     # Mock image bytes
     image_bytes = b"fake_image_content"
     

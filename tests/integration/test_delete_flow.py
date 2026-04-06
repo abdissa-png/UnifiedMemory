@@ -19,7 +19,7 @@ async def test_multi_user_delete_flow(ingestion_pipeline, provider_registry, nam
     6. Verify Document is fully removed from storage (CAS Registry clean).
     """
     tenant_id = "tenant_delete"
-    config = await tenant_manager.register_tenant(tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock:mock-model", dimension=128))
+    config = await tenant_manager.register_tenant(tenant_id, admin_user_id="admin-123", text_embedding=EmbeddingModelConfig(provider="mock", model="mock:mock-model", dimension=128))
     provider_registry.register_embedding_provider("mock:mock-model", MockEmbeddingProvider(model_id="mock:mock-model", dimension=128))
     ns1_config = await namespace_manager.create_namespace(tenant_id, "user1")
     ns2_config = await namespace_manager.create_namespace(tenant_id, "user2")

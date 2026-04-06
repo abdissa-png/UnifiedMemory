@@ -29,7 +29,7 @@ async def test_dense_respects_namespaces_array():
     provider_registry.register_embedding_provider("mock:mock-model", MockEmbeddingProvider(model_id="mock:mock-model", dimension=8))
     # Two namespaces in same tenant
     tenant_id = "tenant-dense"
-    config = await tenant_manager.register_tenant(tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock:mock-model", dimension=8))
+    config = await tenant_manager.register_tenant(tenant_id, admin_user_id="admin-123", text_embedding=EmbeddingModelConfig(provider="mock", model="mock:mock-model", dimension=8))
     ns1_cfg = await ns_manager.create_namespace(tenant_id, "alice")
     ns2_cfg = await ns_manager.create_namespace(tenant_id, "bob")
 
