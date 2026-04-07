@@ -34,7 +34,12 @@ async def test_unified_search_flow():
 
     from unified_memory.storage.base import VectorSearchResult
     mock_vector_store.search.return_value = [
-        VectorSearchResult(id="vec1", score=0.9, metadata={"content_hash": "h1", "namespace": "ns1"}, content=None)
+        VectorSearchResult(
+            id="vec1",
+            score=0.9,
+            metadata={"document_id": "doc-123", "content_hash": "h1", "namespace": "ns1"},
+            content=None,
+        )
     ]
     mock_content_store.get_content.return_value = "Dense Content"
 
@@ -79,7 +84,7 @@ async def test_unified_search_flow():
         user_id="user1",
         namespace="ns1",
         config=config,
-        filters={"dense": {"content_hash": "h1"}},
+        filters={"dense": {"document_id": "doc-123"}},
     )
 
     assert len(results) >= 1
@@ -87,9 +92,9 @@ async def test_unified_search_flow():
     assert mock_graph_store.personalized_pagerank.called
     assert mock_reranker.rerank.called
 
-    # Dense path should receive the dense filters
+    # Dense path receives allowlisted filters only (content_hash is dropped)
     assert any(
-        call.kwargs.get("filters") == {"content_hash": "h1"}
+        call.kwargs.get("filters") == {"document_id": "doc-123"}
         for call in mock_vector_store.search.call_args_list
         if "filters" in call.kwargs
     )

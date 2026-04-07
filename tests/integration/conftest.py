@@ -41,15 +41,6 @@ async def real_graph_store():
     yield store
     await store.close()
 
-@pytest.fixture(scope="function")
-async def cleanup_collections(real_vector_store):
-    """Cleanup collections after test."""
-    yield
-    collections = await real_vector_store.list_collections("test_")
-    for c in collections:
-        await real_vector_store.delete_collection(c)
-
-
 @pytest_asyncio.fixture(scope="function")
 async def real_redis_kv_store():
     """Redis KV store; skips if Redis is not available."""
@@ -61,7 +52,10 @@ async def real_redis_kv_store():
         await store.delete(ping_key)
     except (ImportError, Exception) as e:
         pytest.skip(f"Redis not available or dependency missing: {e}")
-    yield store
+    try:
+        yield store
+    finally:
+        await store._redis.aclose()
 
 
 @pytest_asyncio.fixture(scope="function")

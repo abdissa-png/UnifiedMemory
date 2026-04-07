@@ -1,6 +1,7 @@
-import pytest
-import os
 import uuid
+
+import pytest
+
 from unified_memory.storage.kv.memory_store import MemoryKVStore
 
 @pytest.fixture
@@ -119,17 +120,7 @@ async def test_scan_and_delete_pattern(kv_store):
     assert len(keys) == 1
 
 
-@pytest.fixture
-def redis_url():
-    return os.getenv("REDIS_URL","redis://localhost:6379/0")
-
-
-@pytest.fixture
-def redis_kv_store(redis_url):
-    if not redis_url:
-        pytest.skip("REDIS_URL not set; skipping RedisKVStore parity tests.")
-    from unified_memory.storage.kv.redis_store import RedisKVStore
-    return RedisKVStore(url=redis_url)
+# redis_url and redis_kv_store fixtures: tests/unit/conftest.py
 
 
 @pytest.mark.asyncio
