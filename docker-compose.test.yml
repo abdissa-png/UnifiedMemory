@@ -8,6 +8,9 @@
 services:
   redis:
     image: redis:7-alpine
+    # Ephemeral: no RDB/AOF — avoids fork-based saves that trigger the
+    # vm.overcommit_memory warning on many Linux hosts and matches test usage.
+    command: redis-server --save "" --appendonly no
     ports:
       - "6379:6379"
     healthcheck:
@@ -17,6 +20,7 @@ services:
       retries: 5
 
   qdrant:
+    # Ephemeral storage inside the container is expected for integration tests.
     image: qdrant/qdrant:latest
     ports:
       - "6333:6333"

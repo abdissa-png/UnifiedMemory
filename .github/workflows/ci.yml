@@ -32,7 +32,8 @@ jobs:
 
       - name: Start Redis for RedisKVStore parity tests
         run: |
-          docker run -d --name ums-redis-unit -p 6379:6379 redis:7-alpine
+          docker run -d --name ums-redis-unit -p 6379:6379 redis:7-alpine \
+            redis-server --save "" --appendonly no
           for i in $(seq 1 45); do
             if docker exec ums-redis-unit redis-cli ping 2>/dev/null | grep -q PONG; then
               echo "Redis is up"
@@ -81,9 +82,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[all]"
 
-      # Elasticsearch 8 maps many memory areas; default limit often breaks startup on Linux runners.
-      - name: Raise vm.max_map_count for Elasticsearch
-        run: sudo sysctl -w vm.max_map_count=262144
+      # Elasticsearch: mmap limits. Redis: overcommit helps fork-based workloads on some hosts.
+      - name: Tune Linux VM (Elasticsearch + Redis)
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          sudo sysctl -w vm.overcommit_memory=1
 
       - name: Start infrastructure (Redis, Qdrant, Neo4j, Elasticsearch)
         id: compose_up
