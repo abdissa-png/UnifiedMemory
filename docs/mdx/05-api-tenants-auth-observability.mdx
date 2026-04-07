@@ -1,0 +1,185 @@
+---
+title: 'API, tenants, auth, observability (deep dive)'
+description: 'FastAPI surface, JWT, ACL enforcement, SQL sidecar, tracing and audit.'
+sidebar_position: 5
+---
+
+# API, tenants, auth, and observability (extended)
+
+The **HTTP layer** adds **authentication**, **namespace ACLs**, **SQL-backed** chat and usage accounting, and **observability** hooks on top of the same **`SystemContext`** used in library mode.
+
+---
+
+## 1. FastAPI stack (layers)
+
+```mermaid
+flowchart TB
+  subgraph edge["Edge"]
+    CORS[CORS middleware]
+    MW[RequestContextMiddleware]
+  end
+  subgraph routes["Routers /v1"]
+    AUTH[auth]
+    NS[namespaces]
+    ING[ingestion]
+    SEA[search]
+    CHA[chat]
+    ADM[admin]
+  end
+  edge --> routes
+  routes --> DEP[Depends SystemContext JWT ACL]
+```
+
+---
+
+## 2. Lifespan: what starts at boot
+
+```mermaid
+sequenceDiagram
+  participant L as Lifespan
+  participant SC as SystemContext
+  participant SQL as SQL engine
+  participant TM as TenantManager ChatSession Audit
+  L->>SC: from_config_file or empty
+  L->>SC: build_services
+  L->>SQL: create_engine init_db
+  L->>TM: attach to context
+  L->>L: set_flush_callback tracing to SQL
+```
+
+Typical environment variables (see **`docs/setup-and-configuration.md`** for the full list and `.env.example`):
+
+| Variable | Role |
+| --- | --- |
+| **`UMS_CONFIG`** | Path or inline YAML/dict for `SystemContext` |
+| **`UMS_DATABASE_URL`** | Async SQLAlchemy URL for users, chat, audit, usage |
+| **`UMS_JWT_SECRET`** | Signing secret for access tokens |
+| **`UMS_ENABLE_INNGEST`** | Opt-in Inngest client + `serve()` wiring |
+| **`OPENAI_API_KEY`** / provider keys | Embeddings, LLM, extractors when using OpenAI-backed providers |
+
+---
+
+## 3. JWT authentication (conceptual)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as AuthLoginRoute
+  participant TM as TenantManager
+  C->>A: email password
+  A->>TM: verify user
+  A-->>C: JWT access_token
+  Note over C: Bearer on subsequent calls
+```
+
+---
+
+## 4. ACL dependency (`ACLChecker`)
+
+Routes that carry a **namespace** path use **`ACLChecker(Permission.X)`** after **`get_current_user`**.
+
+```mermaid
+flowchart TD
+  REQ[Request + Bearer] --> JWT[decode_access_token]
+  JWT --> USER[AuthenticatedUser tenant_id user_id]
+  USER --> NS[Load NamespaceConfig]
+  NS --> TEN{tenant_id match?}
+  TEN -->|no| E403[403 cross-tenant]
+  TEN -->|yes| ACL[NamespaceACL.check_permission]
+  ACL --> OK[Inject ns_config to handler]
+  ACL --> DENY[403 missing permission]
+```
+
+**Public namespaces:** if **`ns_config.scope == "public"`** and the route requires **`Permission.READ`** only, **`ACLChecker`** returns the config **without** listing the user on the namespace ACL. **WRITE**, **DELETE**, **ADMIN**, and **SHARE** still require explicit ACL grants. See **`api/deps.py`**.
+
+---
+
+## 5. Permission lattice (simplified)
+
+```mermaid
+flowchart LR
+  READ[READ search list]
+  WRITE[WRITE ingest]
+  DELETE[DELETE documents]
+  ADMIN[ADMIN namespace delete]
+  SHARE[SHARE ACL]
+```
+
+---
+
+## 6. Chat and SQL dependency
+
+Chat endpoints require **`chat_session_manager`**; if SQL is not configured, handlers return **501** (“Chat sessions not configured”).
+
+```mermaid
+flowchart LR
+  CHAT["HTTP /v1/chat"] --> SM[ChatSessionManager]
+  SM --> DB[(chat_sessions messages)]
+  CHAT --> QA[QAAgent optional]
+```
+
+---
+
+## 7. Tracing and token usage flush
+
+```mermaid
+flowchart LR
+  TR["@traced decorators"] --> CTX[Async trace context]
+  CTX --> FL[flush callback on scope exit]
+  FL --> TU[(token_usage rows)]
+```
+
+---
+
+## 8. Audit trail
+
+**`AuditLogger`** persists **security-relevant** actions to **`audit_events`** for investigations.
+
+```mermaid
+flowchart LR
+  API[Admin or sensitive routes] --> AUD[AuditLogger]
+  AUD --> AE[(audit_events)]
+```
+
+---
+
+## 9. Inngest registration (optional)
+
+On startup, if Inngest client and functions exist, the app may register **`inngest.fast_api.serve`**.
+
+```mermaid
+flowchart LR
+  APP[FastAPI] --> ING[inngest.fast_api.serve]
+  ING --> FNS[ingest delete functions]
+```
+
+---
+
+## 10. End-to-end: authenticated search call
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as SearchEndpoint
+  participant ACL as ACLChecker READ
+  participant USS as UnifiedSearchService
+  C->>S: Bearer + body
+  S->>ACL: verify
+  ACL->>USS: search(...)
+  USS-->>C: SearchResponse
+```
+
+---
+
+## Cross-links (canonical Markdown in repo)
+
+These pages live under `docs/` next to this MDX site (not served by Docusaurus by default):
+
+- `docs/rest-api-reference.md` — REST route table
+- `docs/security-deployment-and-operations.md` — security and operations
+- `docs/setup-and-configuration.md` — environment and YAML reference
+
+## Next
+
+- [Agents, workflows, and client apps](/docs/agents-workflows-and-apps) — QAAgent, Inngest, Streamlit client.
+- [Domain validation and quality](/docs/domain-validation-and-quality) — namespace grammar and quality gates.

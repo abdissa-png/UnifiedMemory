@@ -1,0 +1,287 @@
+---
+title: 'System overview (deep dive)'
+description: 'C4-style views, deployment topology, and end-to-end journeys for the unified memory platform.'
+sidebar_position: 0
+---
+
+# System overview (extended)
+
+This chapter gives a **visual, layered** picture of the **Unified Memory System**: who talks to it, what runs inside one process, which external systems it depends on, and how **ingest** and **search** journeys flow through the architecture.
+
+---
+
+## 1. Problem space (what the system optimizes for)
+
+The platform combines:
+
+1. **Durable, tenant-scoped memory** — not a single vector index, but **namespaces**, **ACLs**, and **config** per tenant.
+2. **Hybrid retrieval** — **dense** (embeddings), **sparse** (lexical), and **graph** signals, fused and optionally **reranked**.
+3. **Operational shape** — optional **HTTP API**, **SQL** for users/chat/audit/usage, **tracing** hooks, optional **Inngest** workflows.
+
+```mermaid
+mindmap
+  root((Unified Memory))
+    Ingestion
+      Parse
+      Chunk
+      Embed
+      Extract
+      Index
+    Retrieval
+      Dense
+      Sparse
+      Graph
+      Fusion
+      Rerank
+    Governance
+      Tenants
+      Namespaces
+      ACL
+    Ops
+      API
+      SQL
+      Tracing
+```
+
+---
+
+## 2. System context (external actors)
+
+```mermaid
+flowchart TB
+  subgraph actors["Actors"]
+    U[Users / client apps]
+    ADM[Operators / admins]
+    AUTO[Automation / Inngest]
+  end
+  subgraph ums["Unified Memory deployment"]
+    API[HTTP API FastAPI]
+    WF[Workflow workers optional]
+  end
+  subgraph ext["External services"]
+    LLM[LLM and embedding APIs]
+    OBJ[(Object storage optional)]
+  end
+  subgraph data["Data plane"]
+    KV[(KV)]
+    VEC[(Vector)]
+    G[(Graph)]
+    ES[(Elasticsearch optional)]
+    SQL[(SQL)]
+  end
+  U --> API
+  ADM --> API
+  AUTO --> WF
+  API --> LLM
+  WF --> API
+  API --> KV
+  API --> VEC
+  API --> G
+  API --> ES
+  API --> SQL
+```
+
+**Reading the diagram:** clients interact with **FastAPI**; optional **Inngest** (or similar) drives durable workflows that still call into the same **ingestion** logic. **LLM/embedding** calls leave the process to vendor APIs. **Five storage roles** appear (KV, vector, graph, optional ES, SQL)—each has different consistency and query semantics (see Storage chapter).
+
+---
+
+## 3. Container view (single API process)
+
+One **Python process** typically hosts **FastAPI**, **SystemContext**, and orchestration services. **SQL** is often Postgres or SQLite; **KV/vector/graph/ES** are separate processes or managed services.
+
+```mermaid
+flowchart LR
+  subgraph process["Python process"]
+    FA[FastAPI]
+    MW[Middleware context]
+    CTX[SystemContext]
+    IP[IngestionPipeline]
+    US[UnifiedSearchService]
+    QA[QAAgent]
+    PR[ProviderRegistry]
+    FA --> CTX
+    CTX --> IP
+    CTX --> US
+    CTX --> QA
+    CTX --> PR
+  end
+  subgraph sidecar["SQL sidecar logical"]
+    DB[(Async SQLAlchemy)]
+  end
+  FA --> DB
+  CTX --> DB
+```
+
+**QAAgent** depends on **UnifiedSearchService** and **ProviderRegistry**; **chat** routes depend on **SQL** session manager when enabled.
+
+---
+
+## 4. Logical layering (dependency direction)
+
+```mermaid
+flowchart TB
+  L1[Adapters: HTTP routes Streamlit]
+  L2[Application: pipeline unified search agents workflows]
+  L3[Domain: types namespace configs ACLs]
+  L4[Infrastructure: vector graph kv sql search]
+  L1 --> L2
+  L2 --> L3
+  L2 --> L4
+```
+
+**Intent:** **routes** do not embed vendor SDK details; **orchestration** (`IngestionPipeline`, `UnifiedSearchService`) depends on **abstractions** and **domain types**; **infrastructure** implements protocols/ABCs.
+
+---
+
+## 5. Data-store responsibility (mental model)
+
+```mermaid
+flowchart TB
+  subgraph query["Query / access pattern"]
+    KV["KV — metadata CAS keys"]
+    V["Vector — k-NN similarity"]
+    G2["Graph — traversals PPR"]
+    ES["ES — full text sparse"]
+    SQL2["SQL — users chat audit usage"]
+  end
+```
+
+| Store | Primary job |
+|-------|----------------|
+| **KV** | Versioned metadata, CAS registry, namespace docs |
+| **Vector** | k-NN / similarity over embeddings |
+| **Graph** | Entities, edges, PPR-style walks |
+| **Elasticsearch** (optional) | Full-text sparse retrieval when configured |
+| **SQL** | Users, passwords, chat, audit, token usage rows |
+
+---
+
+## 6. End-to-end: HTTP request lifecycle (conceptual)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant F as FastAPI
+  participant M as Middleware
+  participant D as Depends ACL JWT
+  participant H as Route handler
+  participant X as SystemContext
+  C->>F: HTTPS request
+  F->>M: RequestContextMiddleware
+  M->>D: get_current_user ACLChecker
+  D->>X: namespace_manager tenant check
+  H->>X: ingestion_pipeline or search_service
+  X-->>C: JSON response
+```
+
+---
+
+## 7. End-to-end: search journey (high level)
+
+```mermaid
+flowchart TB
+  Q[Query + user_id + namespace] --> RC[RetrievalConfig.resolve]
+  RC --> EMB[Embed query once]
+  EMB --> P[Parallel tasks]
+  P --> D[DenseRetriever]
+  P --> S[SparseRetriever]
+  P --> G[GraphRetriever]
+  D --> FUS[Fusion RRF or linear]
+  S --> FUS
+  G --> FUS
+  FUS --> RR{reranker configured?}
+  RR -->|yes| RER[Reranker]
+  RR -->|no| OUT[List RetrievalResult]
+  RER --> OUT
+```
+
+---
+
+## 8. End-to-end: ingestion journey (high level)
+
+```mermaid
+flowchart LR
+  IN[Bytes or text] --> PAR[DocumentParser]
+  PAR --> CH[Chunker]
+  CH --> HASH[Hashes and dedup gates]
+  HASH --> EMB[Embed chunks]
+  EMB --> EXT[Extractor optional]
+  EXT --> IDX[Index vector graph sparse]
+  EXT --> CAS[CAS DocumentRegistry]
+```
+
+---
+
+## 9. Multi-tenant isolation (conceptual)
+
+```mermaid
+erDiagram
+  TENANT ||--o{ NAMESPACE : owns
+  TENANT ||--o{ USER : has
+  NAMESPACE ||--|| NS_CONFIG : has
+  NS_CONFIG ||--o{ ACL : contains
+  USER }o--o{ NAMESPACE : accesses_via_ACL
+```
+
+Implementation detail: isolation is enforced in **KV-stored configs**, **HTTP ACL**, and **hash scoping** (`tenant_id` in content/document hashes)—see Domain and API chapters.
+
+---
+
+## 10. Optional asynchronous workflows (Inngest)
+
+When enabled, durable **ingest** / **delete** functions run outside the hot request path but call the same **IngestionPipeline** with **artifact** externalization for large payloads.
+
+```mermaid
+flowchart LR
+  EVT[Cloud event] --> FN[Inngest function]
+  FN --> ART[Artifact store refs]
+  FN --> PIPE[IngestionPipeline]
+  PIPE --> STO[(Stores)]
+```
+
+---
+
+## 11. Failure domains (where things break independently)
+
+```mermaid
+flowchart TB
+  subgraph fd["Independent failure domains"]
+    A[Embedding API rate limit]
+    B[Vector DB timeout]
+    C[Graph DB read-only]
+    D[SQL connection pool exhausted]
+    E[LLM extractor JSON invalid]
+  end
+```
+
+**Operations implication:** monitor each **backend** separately; **circuit breakers** and **timeouts** per dependency class reduce cascading outages.
+
+---
+
+## 12. Figure: simplified deployment (HA-ish)
+
+```mermaid
+flowchart TB
+  LB[Load balancer TLS]
+  LB --> A1[API replica 1]
+  LB --> A2[API replica 2]
+  A1 & A2 --> PG[(Postgres)]
+  A1 & A2 --> RD[(Redis)]
+  A1 & A2 --> QD[(Qdrant)]
+  A1 & A2 --> N4J[(Neo4j)]
+  A1 & A2 --> ES[(Elasticsearch)]
+```
+
+**Constraint:** **In-memory** KV/vector/graph **cannot** be shared across replicas—use real backends for horizontal scale.
+
+---
+
+## Next chapters
+
+- [Bootstrap and providers](/docs/bootstrap-and-providers) — how `SystemContext` wires concrete implementations.
+- [Ingestion pipeline](/docs/ingestion-pipeline) — deeper ingest stages and CAS.
+- [Retrieval, fusion, reranking](/docs/retrieval-fusion-rerank) — parallel retrieval and score fusion.
+- [Agents, workflows, and client apps](/docs/agents-workflows-and-apps) — QAAgent, Inngest, Streamlit demo (easy to miss if you only read chapters 00–05).
+- [Domain validation and quality](/docs/domain-validation-and-quality) — namespace grammar, JSON repair, embedding cache, and how MDX relates to `docs/*.md`.
+
+**Canonical companion:** the full **documentation map** and reading order live in **`docs/README.md`** (Markdown in the repo `docs/` folder). Use it for **route tables**, **security checklists**, and **testing** detail not repeated in MDX.

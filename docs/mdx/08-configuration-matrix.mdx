@@ -1,0 +1,161 @@
+---
+title: 'Configuration matrix (deep dive)'
+description: 'YAML sections, environment interpolation, validation rules, and API-only variables.'
+sidebar_position: 8
+---
+
+# Configuration matrix (extended)
+
+This page is a **single map** from **`config/app.example.yaml`** and **`.env.example`** to runtime behavior. Use it with **`docs/setup-and-configuration.md`** for prose and procedures.
+
+**Source of truth in code:** `unified_memory/core/config.py` (`InfraConfig`, `AppConfig`, `load_app_config`, `app_config_to_dict`, `validate_config_compatibility`) and `unified_memory/bootstrap.py` (`SystemContext.from_config_file`).
+
+---
+
+## 1. How configuration is loaded
+
+```mermaid
+flowchart LR
+  Y[YAML file] --> INT["Interpolate ENV in strings"]
+  INT --> LD[load_app_config]
+  LD --> VAL[validate_config_compatibility]
+  VAL --> FL[app_config_to_dict]
+  FL --> CTX[SystemContext.__init__]
+```
+
+- **`${VAR}`** in any string value is replaced with **`os.getenv(VAR, "")`** recursively (`_interpolate_env`).
+- **`from_config_file`** raises **`ValueError`** if validation returns any errors.
+- The flattened dict matches the **`SystemContext(config=...)`** contract (store backends, provider maps, **`defaults`**).
+
+---
+
+## 2. Infrastructure (`infra:`)
+
+| Key | Typical values | Env placeholders in example | Consumed by |
+| --- | --- | --- | --- |
+| **`kv_store`** | `memory`, `redis` | — | KV metadata / CAS registry |
+| **`redis_url`** | Redis URL | `REDIS_URL` | Required when `kv_store` is `redis` |
+| **`vector_store`** | `memory`, `qdrant` | — | Vector index |
+| **`qdrant_url`** | HTTP gRPC URL | `QDRANT_URL` | Required when `vector_store` is `qdrant` |
+| **`qdrant_api_key`** | optional secret | `QDRANT_API_KEY` | Qdrant cloud |
+| **`graph_store`** | `networkx`, `neo4j` | — | Graph backend |
+| **`neo4j_uri`** | Bolt URI | `NEO4J_URI` | Neo4j driver |
+| **`neo4j_auth_user`**, **`neo4j_auth_password`** | credentials | `NEO4J_AUTH_USER`, `NEO4J_AUTH_PASSWORD` | Passed as **`neo4j_auth`** tuple to the store |
+| **`sparse_retriever`** | `bm25`, `elasticsearch` | — | Sparse retrieval backend |
+| **`elasticsearch_url`** | cluster URL | `ELASTICSEARCH_URL` | Required when sparse is `elasticsearch` |
+| **`elasticsearch_index`** | index name | `ELASTICSEARCH_INDEX` | Required when **`sparse`** is in **`defaults.retrieval_paths`** with ES |
+| **`elasticsearch_api_key`** | optional | `ELASTICSEARCH_API_KEY` | ES security |
+
+**Elasticsearch:** when **`sparse_retriever`** is **`elasticsearch`**, **`SystemContext`** also builds **`elasticsearch_store`** for the sparse/content path (shared client instance).
+
+---
+
+## 3. Provider maps (keys are arbitrary IDs)
+
+### `embedding_providers:`
+
+| Field | Meaning |
+| --- | --- |
+| **`provider`** | e.g. `mock`, `openai` |
+| **`model`** | Vendor model id |
+| **`dimension`** | Vector size (must match index / model) |
+| **`api_key`**, **`base_url`** | Optional; often `${OPENAI_API_KEY}`, `${OPENAI_BASE_URL}` |
+| **`modality`** | `text` (default), or `vision` / `image` / `shared` for visual indexing |
+
+Registry keys in YAML (e.g. **`openai:text-embedding-3-small`**) are the strings **`NamespaceConfig`** / tenant config reference as **embedding model ids**.
+
+### `llm_providers:`
+
+Used for **LLM extraction**, **QAAgent**, and chat. Fields: **`provider`**, **`model`**, optional **`api_key`**, **`base_url`**, **`supports_images`**.
+
+### `extractors:`
+
+| **`type`** | Extra fields |
+| --- | --- |
+| **`mock`** | none |
+| **`llm`** | **`llm_provider`** must match a key in **`llm_providers`** (validated) |
+
+### `rerankers:`
+
+| **`type`** | Typical fields |
+| --- | --- |
+| **`bge`** | **`model`** (e.g. `${BGE_RERANKER_MODEL}`) |
+| **`cohere`** | **`model`**, **`api_key`** |
+
+---
+
+## 4. Defaults (`defaults:`)
+
+| Key | Role |
+| --- | --- |
+| **`retrieval_paths`** | List: `dense`, `sparse`, `graph` — drives **UnifiedSearchService** fan-out |
+| **`skip_embedding`** | Reuse embeddings when possible; **must not** be `true` with **`graph`** in paths (graph path needs entity embeddings) |
+| **`enable_visual_indexing`** | Page images indexed with a **vision**-modality embedding provider; requires at least one provider with modality **`vision`**, **`image`**, or **`shared`** |
+
+---
+
+## 5. Top-level YAML
+
+| Key | Role |
+| --- | --- |
+| **`config_version`** | Integer; carried through **`app_config_to_dict`** for forward compatibility |
+
+---
+
+## 6. Example YAML blocks **not** in `AppConfig` (important)
+
+`config/app.example.yaml` also contains **`auth:`**, **`sql_database_url:`**, and **`pricing:`**. **`load_app_config`** only constructs **`AppConfig`** fields listed in `core/config.py` — it **does not** parse those sections into the dataclass, and they are **not** passed to **`SystemContext`**.
+
+| Section in example YAML | Actual runtime source |
+| --- | --- |
+| **`auth.jwt_secret`**, **`token_expiry_minutes`** | FastAPI lifespan: **`UMS_JWT_SECRET`**, **`UMS_TOKEN_EXPIRE_MINUTES`** (env) |
+| **`sql_database_url`** | **`UMS_DATABASE_URL`** (env) |
+| **`pricing`** | Not referenced in `src/unified_memory` today; documentation / future cost display only |
+
+Treat the YAML copies as **documentation alignment** with **`.env.example`**; for the running API, prefer **environment variables** as implemented in `api/app.py`.
+
+---
+
+## 7. Environment variables (quick matrix)
+
+| Variable | Purpose |
+| --- | --- |
+| **`UMS_CONFIG`** | Path to YAML passed to **`SystemContext.from_config_file`** |
+| **`UMS_JWT_SECRET`** | JWT signing (API) |
+| **`UMS_TOKEN_EXPIRE_MINUTES`** | Access token lifetime (API; default `60`) |
+| **`UMS_DATABASE_URL`** | Async SQLAlchemy URL for users, chat, audit, usage |
+| **`UMS_ENABLE_INNGEST`** | `1` / `true` → **`build_services(enable_inngest=True)`** |
+| **`REDIS_URL`**, **`QDRANT_URL`**, **`NEO4J_*`**, **`ELASTICSEARCH_*`** | Backend URLs when YAML uses **`${...}`** |
+| **`OPENAI_API_KEY`**, **`OPENAI_BASE_URL`** | OpenAI-compatible providers |
+| **`BGE_RERANKER_MODEL`**, **`COHERE_API_KEY`**, **`COHERE_RERANKER_MODEL`** | Rerankers when configured |
+| **`LOG_LEVEL`** | Logging (see setup doc) |
+
+Full list and examples: **`.env.example`** and **`docs/setup-and-configuration.md`**.
+
+---
+
+## 8. `validate_config_compatibility` (what fails fast)
+
+Summarized from `validate_config_compatibility` in `core/config.py`:
+
+- **`graph`** in **`retrieval_paths`** but **`graph_store`** is **`none`** — applies when passing a **raw** dict into **`SystemContext`**; **`load_app_config`** normally yields **`networkx`** or **`neo4j`** only.
+- **`sparse_retriever: elasticsearch`** with empty **`elasticsearch_url`**, or **`sparse`** enabled with empty **`elasticsearch_index`**.
+- **`vector_store: qdrant`** with empty **`qdrant_url`**.
+- **`kv_store: redis`** with empty **`redis_url`**.
+- **`enable_visual_indexing: true`** without any vision-capable **embedding** provider.
+- **`skip_embedding: true`** with **`graph`** in **`retrieval_paths`**.
+- **`dense`** or **`graph`** in paths with an **empty** **`embedding_providers`** map.
+- **`extractors`** entry **`type: llm`** referencing a missing **`llm_provider`** key.
+
+---
+
+## 9. Hot reload constraints
+
+**`hot_reload_from_file`** refuses to change **`kv_store`**, **`vector_store`**, **`graph_store`**, or **`sparse_retriever`** once an **`AppConfig`** was already loaded (see **`bootstrap.py`**). Provider and model changes without switching those backends are the intended reload path.
+
+---
+
+## Next
+
+- [Bootstrap and providers](/docs/bootstrap-and-providers) — how this dict becomes live stores and **`build_services`**.
+- **`docs/setup-and-configuration.md`** — install, extras, and operational env setup.

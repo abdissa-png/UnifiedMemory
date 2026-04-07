@@ -1,0 +1,174 @@
+---
+title: 'Retrieval, fusion, and reranking (deep dive)'
+description: 'UnifiedSearchService orchestration, parallel paths, fusion strategies, and rerankers.'
+sidebar_position: 3
+---
+
+# Retrieval, fusion, and reranking (extended)
+
+**`UnifiedSearchService`** is the **single entry** for hybrid search: it resolves **namespace** and **`RetrievalConfig`**, embeds the **query once**, runs **dense**, **sparse**, and **graph** retrieval (according to config), **fuses** ranked lists, and optionally **reranks**.
+
+---
+
+## 1. Orchestration overview
+
+```mermaid
+flowchart TB
+  IN[search query user_id namespace] --> NS[Default namespace if omitted]
+  NS --> CFG[RetrievalConfig.resolve]
+  CFG --> NSG[Load NamespaceConfig + TenantConfig]
+  NSG --> EMB[resolve_embedding_provider]
+  EMB --> QE[embed query once]
+  QE --> TN[target_namespaces]
+  TN --> PAR[asyncio gather tasks]
+  PAR --> DENSE[DenseRetriever]
+  PAR --> SPARSE[SparseRetriever]
+  PAR --> GRAPH[GraphRetriever]
+  DENSE --> FUS[Fusion module]
+  SPARSE --> FUS
+  GRAPH --> FUS
+  FUS --> RER{Reranker?}
+  RER -->|yes| RR[rerank]
+  RER -->|no| OUT[RetrievalResult list]
+  RR --> OUT
+```
+
+---
+
+## 2. Namespace and config resolution
+
+```mermaid
+sequenceDiagram
+  participant USS as UnifiedSearchService
+  participant NM as NamespaceManager
+  USS->>NM: get_config(namespace)
+  NM-->>USS: NamespaceConfig
+  USS->>NM: get_tenant_config(tenant_id)
+  NM-->>USS: TenantConfig embedding model
+```
+
+If **`namespace`** is omitted, the service defaults to the **user private namespace** string derived from **`Namespace(user_id).to_string()`**.
+
+---
+
+## 3. Parallel retrieval (fan-out)
+
+```mermaid
+flowchart LR
+  QE[Query embedding] --> D[Dense path]
+  QTXT[Query text] --> S[Sparse path]
+  QTXT --> G[Graph path]
+  D & S & G --> MERGE[Fusion]
+```
+
+**Filters:** Either a single **`filters`** dict for all paths, or **per-path** keys `dense`, `sparse`, `graph` inside the dict—implementation inspects structure before dispatch.
+
+---
+
+## 4. Fusion strategies (conceptual)
+
+The **`fusion`** module provides **score normalization**, **reciprocal rank fusion (RRF)**, and **linear fusion**.
+
+```mermaid
+flowchart TB
+  subgraph inputs["Ranked lists"]
+    L1[List A dense]
+    L2[List B sparse]
+    L3[List C graph]
+  end
+  subgraph fusion["Fusion"]
+    NORM[normalize_scores optional]
+    RRF[reciprocal_rank_fusion]
+    LIN[linear_fusion]
+  end
+  L1 --> RRF
+  L2 --> RRF
+  L3 --> RRF
+  L1 --> LIN
+  L2 --> LIN
+  L3 --> LIN
+```
+
+**RRF** is robust when raw scores are **not calibrated** across modalities. **Linear fusion** applies when you have **weights** and comparable normalized scores.
+
+---
+
+## 5. Reranking (second stage)
+
+```mermaid
+flowchart LR
+  CAND[Top-K fused candidates] --> RER[Reranker protocol]
+  RER --> OUT[Re-ordered list]
+```
+
+Rerankers (e.g. **BGE**, **Cohere**) are resolved via **`ProviderRegistry`** according to tenant/namespace configuration.
+
+---
+
+## 6. Dense retriever (role)
+
+**`DenseRetriever`** queries the **vector store** with namespace-scoped collections and hydrates content via **`ContentStore`** as needed (pattern in implementation).
+
+```mermaid
+flowchart LR
+  QV[Query vector] --> VS[VectorStoreBackend.search]
+  VS --> RES[Vector hits]
+  RES --> CS[ContentStore enrich]
+```
+
+---
+
+## 7. Sparse retriever (role)
+
+Either **in-process BM25** (`SparseRetriever`) or **`ElasticSearchStore`** implementing the sparse protocol when Elasticsearch is configured.
+
+```mermaid
+flowchart LR
+  QT[Query text] --> BM[BM25 in memory]
+  QT --> ES[Elasticsearch index]
+```
+
+---
+
+## 8. Graph retriever (role)
+
+**`GraphRetriever`** uses **graph store** operations (and may combine with vector signals depending on implementation) for multi-hop / PPR-style behavior—see `retrieval/graph.py` and graph store protocol.
+
+```mermaid
+flowchart TB
+  SEEDS[Seed entities or nodes] --> GQ[Graph queries]
+  GQ --> PPR[PPR style operations where configured]
+  PPR --> NODES[Ranked passage nodes]
+```
+
+---
+
+## 9. Tracing boundary
+
+```mermaid
+flowchart LR
+  USS["UnifiedSearchService.search"] --> T["@traced search.unified"]
+  T --> MET[Token usage metrics]
+```
+
+---
+
+## 10. Mental model: why “unified”
+
+```mermaid
+mindmap
+  root((Unified search))
+    One embedding per query
+    Many indexes read in parallel
+    One fusion policy
+    One optional rerank
+    One result type RetrievalResult
+```
+
+---
+
+## Next
+
+- [Storage and data plane](/docs/storage-data-plane) — how hits persist in stores.
+- [API, tenants, auth, observability](/docs/api-tenants-auth-observability) — exposing search over HTTP.
+- [Domain validation and quality](/docs/domain-validation-and-quality) — `RetrievalConfig` pointers and testing map.

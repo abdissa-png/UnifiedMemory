@@ -1,0 +1,213 @@
+---
+title: 'Bootstrap and providers (deep dive)'
+description: 'SystemContext construction, ProviderRegistry, infrastructure matrix, and hot reload.'
+sidebar_position: 1
+---
+
+# Bootstrap and providers (extended)
+
+This chapter details **`SystemContext`** (`unified_memory.bootstrap`): how **infrastructure** is chosen, how **providers** are registered, and how **`build_services`** assembles **IngestionPipeline**, **UnifiedSearchService**, and optional **Inngest** / **QAAgent**.
+
+---
+
+## 1. Composition root pattern
+
+`SystemContext` is the **single composition root** for library mode: one object holds **stores**, **registries**, and **high-level services**.
+
+```mermaid
+flowchart TB
+  CFG[Config dict or YAML] --> CTOR[SystemContext.__init__]
+  CTOR --> KV[KV store]
+  CTOR --> VEC[Vector store]
+  CTOR --> GRA[Graph store]
+  CTOR --> CAS[CAS DocumentRegistry ContentStore]
+  CTOR --> NS[NamespaceManager]
+  CTOR --> REG[ProviderRegistry]
+  CTOR --> REGP[_register_providers]
+  BS[build_services] --> IP[IngestionPipeline]
+  BS --> US[UnifiedSearchService]
+  BS --> QA[QAAgent optional]
+```
+
+---
+
+## 2. Construction sequence (ordered)
+
+```mermaid
+sequenceDiagram
+  participant Caller
+  participant SC as SystemContext
+  participant PR as ProviderRegistry
+  participant BS as build_services
+  Caller->>SC: __init__(config)
+  SC->>SC: _build_kv_store
+  SC->>SC: _build_vector_store
+  SC->>SC: _build_graph_store
+  SC->>SC: CAS + NamespaceManager
+  SC->>PR: new ProviderRegistry
+  SC->>SC: elasticsearch_store if sparse_retriever==elasticsearch
+  SC->>SC: _register_providers
+  Caller->>BS: build_services(...)
+  BS->>BS: DenseRetriever GraphRetriever sparse
+  BS->>BS: artifact image document stores
+  BS->>BS: IngestionPipeline UnifiedSearchService
+  BS->>BS: optional Inngest QA agent
+```
+
+---
+
+## 3. Infrastructure matrix (dict → implementation)
+
+```mermaid
+flowchart LR
+  subgraph keys["Config keys"]
+    k1[kv_store]
+    k2[vector_store]
+    k3[graph_store]
+    k4[sparse_retriever]
+  end
+  subgraph impl["Implementations"]
+    m1[MemoryKV RedisKV]
+    m2[MemoryVector Qdrant]
+    m3[NetworkX Neo4j]
+    m4[BM25 ElasticSearchStore]
+  end
+  k1 --> m1
+  k2 --> m2
+  k3 --> m3
+  k4 --> m4
+```
+
+| Config | Values | Notes |
+|--------|--------|--------|
+| `kv_store` | `memory`, `redis` | Metadata and CAS; use **redis** for multi-process |
+| `vector_store` | `memory`, `qdrant` | Similarity search |
+| `graph_store` | `networkx`, `neo4j` | Graph traversal |
+| `sparse_retriever` | `bm25`, `elasticsearch` | If ES, one **ElasticSearchStore** instance often doubles as sparse backend |
+
+---
+
+## 4. ProviderRegistry contents
+
+```mermaid
+mindmap
+  root((ProviderRegistry))
+    Text embeddings
+      openai:text-embedding-3-small
+      mock:mock-model
+    Vision embeddings
+      openai:clip-...
+    LLM providers
+      openai:gpt-4o-mini
+    Extractors
+      mock llm-default
+    Rerankers
+      bge-local cohere
+    Parsers
+      TextParser MinerU optional
+```
+
+**Modality routing:** YAML `modality: text` vs `vision` / `image` decides whether a key is registered as **text** or **vision** embedding provider.
+
+---
+
+## 5. Registration flow (bootstrap)
+
+```mermaid
+flowchart TD
+  A[Load YAML or dict] --> B[validate_config_compatibility]
+  B --> C[SystemContext.__init__]
+  C --> D[Register parsers TextParser optional MinerU]
+  C --> E[For each embedding_providers]
+  E --> F{modality?}
+  F -->|text| G[register_embedding_provider]
+  F -->|vision| H[register_vision_embedding_provider]
+  C --> I[Build LLMs register_llm_provider]
+  C --> J[Build extractors]
+  C --> K[Build rerankers]
+```
+
+---
+
+## 6. build_services: what gets created
+
+```mermaid
+flowchart TB
+  BS[build_services] --> DR[DenseRetriever]
+  BS --> GR[GraphRetriever]
+  BS --> SP[Sparse BM25 or ES store]
+  DR --> USS[UnifiedSearchService]
+  GR --> USS
+  SP --> USS
+  BS --> ART[LocalFSArtifactStore]
+  BS --> IMG[LocalFSImageContentStore]
+  BS --> DOC[LocalFSDocumentContentStore]
+  ART --> IP[IngestionPipeline]
+  IMG --> IP
+  DOC --> IP
+  IP --> USS
+```
+
+---
+
+## 7. Hot reload (conservative)
+
+`hot_reload_from_file` **re-registers** providers and **rebuilds** services but **refuses** to swap **kv_store**, **vector_store**, **graph_store**, or **sparse_retriever** if an `AppConfig` was already loaded.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Loaded: from_config_file
+  Loaded --> Reloading: hot_reload_from_file
+  Reloading --> Loaded: providers + build_services OK
+  Reloading --> Rejected: infra keys changed
+```
+
+---
+
+## 8. API-only attachments (lifespan)
+
+When running **FastAPI**, the lifespan wires **SQL**, **ChatSessionManager**, **AuditLogger**, **TenantManager**, and **tracing flush** to `TokenUsageRecord`. These fields are **not** required for pure library use.
+
+```mermaid
+flowchart LR
+  APP[FastAPI lifespan] --> CTX[SystemContext]
+  APP --> SQL[Async engine + init_db]
+  CTX --> SQL
+  APP --> FL[set_flush_callback tracing]
+```
+
+---
+
+## 9. Optional Inngest wiring
+
+When `enable_inngest=True`, `_setup_inngest` creates client + **ingest** and **delete** functions referencing the same pipeline and artifact store.
+
+```mermaid
+flowchart LR
+  ING[Inngest ingest fn] --> PIPE[IngestionPipeline]
+  DEL[Inngest delete fn] --> PIPE
+  ING --> ART[ArtifactStore]
+```
+
+---
+
+## 10. Summary figure: one page cheat sheet
+
+```mermaid
+flowchart TB
+  subgraph boot["Bootstrap"]
+    S[SystemContext]
+    B[build_services]
+  end
+  subgraph outputs["Outputs"]
+    I[IngestionPipeline]
+    U[UnifiedSearchService]
+    Q[QAAgent]
+  end
+  S --> B
+  B --> I
+  B --> U
+  B --> Q
+```
+
+See also: [System overview](/docs/system-overview), [Configuration matrix](/docs/configuration-matrix), [Storage and data plane](/docs/storage-data-plane), [Agents, workflows, and client apps](/docs/agents-workflows-and-apps).

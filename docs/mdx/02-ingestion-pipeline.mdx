@@ -1,0 +1,197 @@
+---
+title: 'Ingestion pipeline (deep dive)'
+description: 'Parse, chunk, embed, extract, index, and CAS semantics for document ingestion.'
+sidebar_position: 2
+---
+
+# Ingestion pipeline (extended)
+
+**`IngestionPipeline`** orchestrates turning **raw input** into **indexed memory**: parsed structure, **chunks**, **embeddings**, optional **entity/relation extraction**, writes to **vector**, **graph**, and **sparse** indexes, and **CAS** / **document registry** updates—with **namespace** and **tenant** awareness.
+
+---
+
+## 1. Stage model (conceptual pipeline)
+
+```mermaid
+flowchart LR
+  subgraph input["Input"]
+    RAW[Raw bytes or text]
+  end
+  subgraph parse["Parse"]
+    P[DocumentParser]
+    PD[ParsedDocument]
+  end
+  subgraph chunk["Chunk"]
+    C[Chunker fixed recursive semantic]
+  end
+  subgraph embed["Embed"]
+    E[EmbeddingProvider]
+  end
+  subgraph extract["Extract optional"]
+    X[Extractor LLM or mock]
+  end
+  subgraph index["Index"]
+    V[Vector upsert]
+    GR[Graph upsert]
+    SP[Sparse index]
+  end
+  subgraph meta["Metadata CAS"]
+    CAS[CASRegistry ContentStore]
+    DR[DocumentRegistry]
+  end
+  RAW --> P --> PD --> C --> E
+  E --> X --> V
+  X --> GR
+  X --> SP
+  E --> CAS
+  E --> DR
+```
+
+---
+
+## 2. Saga-style orchestration (intent)
+
+Ingestion performs **multiple writes** (vector, graph, KV metadata). The implementation follows **saga-like** patterns: progress with **compensating** steps on failure where applicable (see source for exact rollback semantics per store).
+
+```mermaid
+flowchart TD
+  START([Start ingest]) --> S1[Step: parse + chunk]
+  S1 --> S2[Step: embed]
+  S2 --> S3[Step: index stores]
+  S3 --> OK([Success])
+  S3 --> FAIL[Failure]
+  FAIL --> COMP["Compensate / unlink partial writes"]
+```
+
+---
+
+## 3. Hashing and deduplication (conceptual)
+
+Content and document identities use **canonical hash helpers** from `core.types` (tenant-scoped).
+
+```mermaid
+flowchart TB
+  T[Tenant ID] --> CH[compute_content_hash chunk]
+  T --> DH[compute_document_hash document]
+  M[Modality] --> CH
+  CH --> VID[compute_vector_id + model]
+```
+
+**Implication:** same **normalized** document text under a tenant maps to a stable **document hash** independent of embedding model; **vector ids** include **model** so re-embedding with another model does not silently overwrite.
+
+---
+
+## 4. Chunking strategies (selection)
+
+```mermaid
+flowchart TD
+  Q[Which chunker?] --> F[FixedSizeChunker]
+  Q --> R[RecursiveChunker]
+  Q --> S[SemanticChunker]
+  F --> CFG[ChunkingConfig overlap size]
+  R --> CFG
+  S --> CFG
+```
+
+`ChunkingConfig` enforces **`chunk_overlap < chunk_size`** to avoid infinite loops.
+
+---
+
+## 5. Parser registry
+
+Bootstrap registers **TextParser** and optionally **MinerU** PDF when available. The pipeline resolves parsers via **`ParserRegistry`** / provider registry.
+
+```mermaid
+flowchart LR
+  FILE[path mime] --> REG[ParserRegistry]
+  REG --> TP[TextParser]
+  REG --> MU[MinerUPDFParser if installed]
+```
+
+---
+
+## 6. Extractors and graph population
+
+**Extractor** implementations turn **chunks** into **ExtractionResult** (entities, relations) used to enrich **graph** edges/nodes and metadata.
+
+```mermaid
+flowchart LR
+  CHK[Chunk] --> EXT[Extractor]
+  EXT --> ER[ExtractionResult]
+  ER --> GRA[GraphStoreBackend]
+  ER --> META[Chunk metadata]
+```
+
+---
+
+## 6b. LLM extractor and robust JSON
+
+**`LLMExtractor`** (`ingestion/extractors/llm_extractor.py`) prompts **`BaseLLMProvider.generate_structured`** for a JSON object with **`entities`** and **`relations`** (see **`ingestion/extractors/schema.py`** for typed results).
+
+**Failure behavior:** parsing uses **`core.json_utils.validate_and_repair_json`** (with **`json-repair`**) after **`clean_json_response`** strips common markdown fences. If extraction still fails, the pipeline returns an **empty** `ExtractionResult` and **logs**—ingest continues without graph enrichment for that chunk.
+
+```mermaid
+flowchart LR
+  RAW[LLM text] --> CLN[clean_json_response]
+  CLN --> REP[validate_and_repair_json]
+  REP --> OK[ExtractionResult]
+  REP --> EMP[Empty result log and continue]
+```
+
+---
+
+## 7. CAS and document registry (logical)
+
+```mermaid
+flowchart TB
+  HASH[Content hash] --> CASREG[CASRegistry refcount]
+  HASH --> CS[ContentStore payload]
+  DOCH[Document hash] --> DR[DocumentRegistry]
+  DR --> NS[Namespace linkage]
+```
+
+**Delete semantics:** vectors/nodes may be **hard-deleted** or **unlinked** depending on whether other namespaces still reference the same content (see integration tests for refcount behavior).
+
+---
+
+## 8. Artifact stores (large payloads)
+
+For workflows or large binaries, **LocalFSArtifactStore** and related stores **externalize** heavy blobs so orchestration layers (e.g. Inngest steps) keep small JSON payloads.
+
+```mermaid
+flowchart LR
+  BIG[Large payload] --> ART[ArtifactStore]
+  ART --> REF[Small reference in step state]
+```
+
+---
+
+## 9. Observability on the pipeline
+
+Key methods use **`@traced`** so retrieval and generation accumulate **usage** records flushed to SQL in API mode.
+
+```mermaid
+flowchart LR
+  PIPE[IngestionPipeline] --> TR[traced spans]
+  TR --> CTX[Trace context]
+  CTX --> SQL[(token_usage optional)]
+```
+
+---
+
+## 10. Failure modes (operator view)
+
+| Stage | Typical failure | Mitigation |
+|-------|-----------------|------------|
+| Parse | Unsupported format | Register parser or reject with 400 |
+| Chunk | Config overlap error | Fix ChunkingConfig |
+| Embed | Rate limit / timeout | Retry policy, backoff |
+| Vector | Dimension mismatch | Align tenant embedding config with index |
+| Graph | Connection | Health checks, circuit breaker |
+
+---
+
+## Next
+
+- [Retrieval, fusion, reranking](/docs/retrieval-fusion-rerank) — how indexed content is found again.
+- [Storage and data plane](/docs/storage-data-plane) — store responsibilities in depth.

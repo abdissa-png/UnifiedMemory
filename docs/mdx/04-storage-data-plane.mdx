@@ -1,0 +1,183 @@
+---
+title: 'Storage and data plane (deep dive)'
+description: 'KV, vector, graph, Elasticsearch, SQL, and CAS boundaries.'
+sidebar_position: 4
+---
+
+# Storage and data plane (extended)
+
+This chapter visualizes **where state lives** and **which abstraction** owns it. Getting this wrong in operations (e.g. expecting Redis HA while using `memory`) is a common source of incidents.
+
+---
+
+## 1. Store roles (single picture)
+
+```mermaid
+flowchart TB
+  subgraph app["Application layer"]
+    CTX[SystemContext]
+    PIPE[IngestionPipeline]
+    SRCH[UnifiedSearchService]
+  end
+  subgraph kv["KV / metadata"]
+    KV[(KVStoreBackend)]
+  end
+  subgraph vec["Similarity"]
+    VS[(VectorStoreBackend)]
+  end
+  subgraph graph["Knowledge graph"]
+    GS[(GraphStoreBackend)]
+  end
+  subgraph sparse["Lexical"]
+    SP[Sparse BM25 or ES]
+  end
+  subgraph sql["Relational API plane"]
+    DB[(SQLAlchemy async)]
+  end
+  subgraph cas["CAS blobs"]
+    CAS[CAS Content Document stores]
+  end
+  CTX --> KV
+  CTX --> VS
+  CTX --> GS
+  CTX --> SP
+  PIPE --> VS
+  PIPE --> GS
+  PIPE --> SP
+  PIPE --> CAS
+  SRCH --> VS
+  SRCH --> GS
+  SRCH --> SP
+  CTX --> CAS
+```
+
+---
+
+## 2. KV: optimistic concurrency
+
+**`KVStoreBackend`** exposes **versioned** values and **compare-and-swap** semantics—suitable for **namespace documents** and **registry** metadata under concurrent writers.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Read: get key
+  Read --> Cas: compare_and_swap expected_version
+  Cas --> OK: success
+  Cas --> Retry: version mismatch
+  Retry --> Read
+```
+
+---
+
+## 3. Vector: collections and namespaces
+
+Vector backends implement **namespace-aware** routing (collections or metadata) so tenants do not leak embeddings across logical boundaries.
+
+```mermaid
+flowchart LR
+  NS[Namespace string] --> ROUTE[Collection name or filter]
+  ROUTE --> VS[VectorStoreBackend.upsert search]
+```
+
+---
+
+## 4. Graph: protocol vs ABC
+
+**`GraphStoreBackend`** is a **Protocol**—implementations **need not** share a base class, which keeps Neo4j and NetworkX adapters independent.
+
+```mermaid
+classDiagram
+  class GraphStoreBackend {
+    <<Protocol>>
+  }
+  NetworkXGraphStore ..|> GraphStoreBackend
+  Neo4jGraphStore ..|> GraphStoreBackend
+```
+
+---
+
+## 5. Elasticsearch dual role
+
+When **`sparse_retriever: elasticsearch`**, **`ElasticSearchStore`** may participate in **sparse retrieval** and related **content** indexing paths—**one** client instance is typically reused from **`SystemContext.elasticsearch_store`**.
+
+```mermaid
+flowchart LR
+  ES[ElasticSearchStore] --> SP[Sparse retrieval interface]
+  ES --> IDX[Full text index path]
+```
+
+---
+
+## 6. SQL: who lives here
+
+**Not** the primary content plane for chunk storage at scale—**users**, **chat sessions**, **messages**, **audit events**, and **token usage** rows.
+
+```mermaid
+erDiagram
+  USER ||--o{ CHAT_SESSION : has
+  CHAT_SESSION ||--o{ CHAT_MESSAGE : contains
+  USER {
+    string tenant_id
+    string email
+  }
+  TOKEN_USAGE {
+    string trace_id
+    string tenant_id
+    int input_tokens
+  }
+```
+
+---
+
+## 7. CAS vs SQL (boundary)
+
+```mermaid
+flowchart TB
+  subgraph content["High volume content plane"]
+    CASB[CAS + blob stores]
+    VECB[Vector + graph]
+  end
+  subgraph control["Control plane API metadata"]
+    SQLB[Postgres SQLite]
+  end
+```
+
+**Rule of thumb:** if it must **join** with billing or **user identity** reliably, it’s a candidate for **SQL**; if it’s **content-addressed** and **deduped**, it’s **CAS/KV/vector**.
+
+---
+
+## 7b. CAS implementation split (chunk vs document vs image)
+
+The **`cas`** package is not a single class:
+
+| Piece | Role |
+| --- | --- |
+| **`ContentStore`** | Chunk-level **content-addressed** payloads (hash → bytes) used with vector/CAS registry |
+| **`DocumentRegistry`**, **`CASRegistry`** | Refcounts, document ↔ namespace linkage, dedup **gates** |
+| **`DocumentContentStore`** (`document_content_store.py`) | Optional **large document** blob storage (e.g. local FS) wired in **`build_services`** |
+| **`ImageContentStore`** (`image_content_store.py`) | **Vision** / image bytes alongside text pipelines when configured |
+
+Bootstrap wires **local FS** or **in-memory** variants for documents and **artifacts** for workflows; operators should confirm **disk paths** and **backup** for any FS-backed store.
+
+---
+
+## 8. Deployment: shared vs in-process stores
+
+```mermaid
+flowchart TB
+  subgraph bad["Anti-pattern for HA"]
+    A1[API 1 MemoryKV]
+    A2[API 2 MemoryKV]
+  end
+  subgraph good["Typical production"]
+    R[(Redis)]
+    A3[API 1] --> R
+    A4[API 2] --> R
+  end
+```
+
+---
+
+## Next
+
+- [API, tenants, auth, observability](/docs/api-tenants-auth-observability) — HTTP surface over these stores.
+- [Agents, workflows, and client apps](/docs/agents-workflows-and-apps) — artifact and document stores in workflow context.
