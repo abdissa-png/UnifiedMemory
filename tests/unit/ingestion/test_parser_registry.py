@@ -1,21 +1,18 @@
 import pytest
 from pathlib import Path
-from unified_memory.ingestion.parsers.registry import get_parser_registry, ParserRegistry
+from unified_memory.ingestion.parsers.registry import ParserRegistry
 from unified_memory.ingestion.parsers.text import TextParser
 
-def test_parser_registry_singleton():
-    """Verify that get_parser_registry returns the same instance."""
-    reg1 = get_parser_registry()
-    reg2 = get_parser_registry()
-    reg3 = ParserRegistry()
-    
-    assert reg1 is reg2
-    assert reg1 is reg3
+def test_parser_registry_instances_are_isolated():
+    """ParserRegistry is now a plain injectable class."""
+    reg1 = ParserRegistry()
+    reg2 = ParserRegistry()
+
+    assert reg1 is not reg2
 
 def test_parser_registry_registration():
     """Verify registration by extension and MIME."""
-    registry = get_parser_registry()
-    registry.clear()
+    registry = ParserRegistry()
     
     parser = TextParser()
     registry.register(parser)

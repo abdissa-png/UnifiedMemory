@@ -1,13 +1,11 @@
 """
-Parser Registry Singleton.
-
-Central registry for document parsers, providing lookup by extension or MIME type.
+Parser registry for document parsers.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Type
+from typing import Dict, Optional
 
 from unified_memory.ingestion.parsers.base import DocumentParser
 
@@ -15,18 +13,11 @@ from unified_memory.ingestion.parsers.base import DocumentParser
 class ParserRegistry:
     """
     Registry of available document parsers.
-    
-    Implemented as a singleton to avoid redundant registrations.
     """
-    
-    _instance: Optional[ParserRegistry] = None
-    
-    def __new__(cls) -> ParserRegistry:
-        if cls._instance is None:
-            cls._instance = super(ParserRegistry, cls).__new__(cls)
-            cls._instance._ext_map = {}
-            cls._instance._mime_map = {}
-        return cls._instance
+
+    def __init__(self) -> None:
+        self._ext_map: Dict[str, DocumentParser] = {}
+        self._mime_map: Dict[str, DocumentParser] = {}
     
     def register(self, parser: DocumentParser) -> None:
         """Register a parser instance."""
@@ -60,8 +51,3 @@ class ParserRegistry:
         """Clear all registrations (mainly for testing)."""
         self._ext_map.clear()
         self._mime_map.clear()
-
-
-def get_parser_registry() -> ParserRegistry:
-    """Get the global ParserRegistry singleton."""
-    return ParserRegistry()

@@ -17,7 +17,7 @@ from unified_memory.cas.document_registry import DocumentRegistry
 from unified_memory.ingestion.extractors.base import Extractor
 from unified_memory.ingestion.extractors.schema import ExtractionResult, ExtractedEntity, ExtractedRelation
 from unified_memory.namespace.manager import NamespaceManager
-from unified_memory.namespace.types import NamespaceConfig, TenantConfig
+from unified_memory.namespace.types import EmbeddingModelConfig, NamespaceConfig, TenantConfig
 from unified_memory.namespace.tenant_manager import TenantManager # Moved from inside test_chunk_overlap
 
 @pytest.fixture
@@ -49,8 +49,10 @@ def pipeline(mock_deps):
 @pytest.mark.asyncio
 async def test_ingest_text(pipeline, mock_deps):
     """Test full ingestion flow for raw text."""
-    ns_id = "tenant:default-tenant/user:test-user"
-    ns_cfg = NamespaceConfig(tenant_id="default-tenant", user_id="test-user")
+    tenant_id = "default-tenant"
+    ns_id = f"tenant:{tenant_id}/user:test-user"
+    ns_cfg = NamespaceConfig(tenant_id=tenant_id, user_id="test-user")
+    await mock_deps["kv"].set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     await mock_deps["kv"].set(f"ns_config:{ns_id}", asdict(ns_cfg))
     
     text = "This is a test document. It should be embedded and stored."
@@ -101,8 +103,10 @@ async def test_ingest_text(pipeline, mock_deps):
 @pytest.mark.asyncio
 async def test_ingest_text_file(pipeline):
     """Test full ingestion flow for a text file."""
-    ns_id = "tenant:file-tenant/user:file-user"
-    ns_cfg = NamespaceConfig(tenant_id="file-tenant", user_id="file-user")
+    tenant_id = "file-tenant"
+    ns_id = f"tenant:{tenant_id}/user:file-user"
+    ns_cfg = NamespaceConfig(tenant_id=tenant_id, user_id="file-user")
+    await pipeline.namespace_manager.kv_store.set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     await pipeline.namespace_manager.kv_store.set(f"ns_config:{ns_id}", asdict(ns_cfg))
     
     content = "# Test Document\n\nThis is paragraph one.\n\nThis is paragraph two."
@@ -187,16 +191,17 @@ async def test_chunk_overlap(mock_deps):
 async def test_duplicate_ingestion(pipeline, mock_deps):
     """Test that duplicate documents skip embedding but link namespaces (Phase 1.3)."""
     text = "This is a shared document content."
-    ns1 = "tenant:shared/user:alice"
-    ns2 = "tenant:shared/user:bob"
+    tenant_id = "shared"
+    ns1 = f"tenant:{tenant_id}/user:alice"
+    ns2 = f"tenant:{tenant_id}/user:bob"
     
     # Setup namespaces
     kv = mock_deps["kv"]
-    ns_cfg1 = NamespaceConfig(tenant_id="shared", user_id="alice")
-    ns_cfg2 = NamespaceConfig(tenant_id="shared", user_id="bob")
+    ns_cfg1 = NamespaceConfig(tenant_id=tenant_id, user_id="alice")
+    ns_cfg2 = NamespaceConfig(tenant_id=tenant_id, user_id="bob")
     await kv.set(f"ns_config:{ns1}", asdict(ns_cfg1))
     await kv.set(f"ns_config:{ns2}", asdict(ns_cfg2))
-
+    await kv.set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     # 1. Ingest as Alice
     res1 = await pipeline.ingest_text(text, ns1, skip_embedding=False)
     assert res1.success
@@ -277,15 +282,16 @@ async def test_tenant_ingestion_config(pipeline, mock_deps):
     assert len(vecs) >= 3
 
 @pytest.mark.asyncio
-async def test_vision_embedding(pipeline, tenant_manager, mock_deps):
+async def test_vision_embedding(pipeline, mock_deps):
     """Test ingestion of document with page images (Phase 2.3)."""
     # Create a ParsedDocument with page images
     # We cheat and bypass ingest_file/text parser logic by calling _process_chunks directly
     
     ns_id = "tenant:vision/user:test"
-    ns_cfg = NamespaceConfig(tenant_id="vision", user_id="test")
+    tenant_id = "vision"
+    ns_cfg = NamespaceConfig(tenant_id=tenant_id, user_id="test")
     await mock_deps["kv"].set(f"ns_config:{ns_id}", asdict(ns_cfg))
-    await tenant_manager.register_tenant("vision",admin_user_id="admin-123", vision_embedding=mock_deps["vision_embedding_provider"])
+    await mock_deps["kv"].set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, vision_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     # Mock image bytes
     image_bytes = b"fake_image_content"
     
@@ -342,7 +348,9 @@ async def test_vision_embedding(pipeline, tenant_manager, mock_deps):
 async def test_relation_embedding(pipeline, mock_deps):
     """Test ingestion with relation extraction and embedding (Phase 2.4)."""
     ns_id = "tenant:rels/user:test"
-    ns_cfg = NamespaceConfig(tenant_id="rels", user_id="test")
+    tenant_id = "rels"
+    ns_cfg = NamespaceConfig(tenant_id=tenant_id, user_id="test")
+    await mock_deps["kv"].set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     await mock_deps["kv"].set(f"ns_config:{ns_id}", asdict(ns_cfg))
     
     # Mock extractor

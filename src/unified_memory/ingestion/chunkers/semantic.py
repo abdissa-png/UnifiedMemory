@@ -7,6 +7,11 @@ Requires an embedding provider.
 
 from __future__ import annotations
 
+from unified_memory.core.exceptions import (
+    NamespaceNotFoundError,
+    ProviderNotFoundError,
+    TenantConfigNotFoundError,
+)
 import re
 import numpy as np
 from typing import Any, List, Optional, Tuple
@@ -141,13 +146,13 @@ class SemanticChunker(Chunker):
 
         ns_config = await self._namespace_manager.get_config(namespace)
         if not ns_config:
-            raise ValueError(f"Namespace not found for semantic chunking: {namespace}")
+            raise NamespaceNotFoundError(
+                f"Namespace not found for semantic chunking: {namespace}"
+            )
 
         tenant_config = await self._namespace_manager.get_tenant_config(ns_config.tenant_id)
-        if not tenant_config:
-            raise ValueError(
-                f"Tenant config not found for semantic chunking (tenant={ns_config.tenant_id})."
-            )
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_config.tenant_id}")
 
         model_cfg = tenant_config.text_embedding
         # Allow tests/configs that register providers keyed only by model id.
@@ -157,7 +162,7 @@ class SemanticChunker(Chunker):
             fallback_key=model_cfg.model,
         )
         if embedder is None:
-            raise ValueError(
+            raise ProviderNotFoundError(
                 f"No embedding provider available for semantic chunking; "
                 f"expected provider '{model_cfg.provider}' model '{model_cfg.model}'."
             )

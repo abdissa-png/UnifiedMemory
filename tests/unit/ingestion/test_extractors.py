@@ -11,7 +11,7 @@ from unified_memory.cas.registry import CASRegistry
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.cas.document_registry import DocumentRegistry
 from unified_memory.namespace.manager import NamespaceManager
-from unified_memory.namespace.types import NamespaceConfig, TenantConfig, ExtractionConfig
+from unified_memory.namespace.types import EmbeddingModelConfig, NamespaceConfig, TenantConfig, ExtractionConfig
 
 @pytest.fixture
 def extraction_deps():
@@ -39,8 +39,10 @@ def pipeline_with_extraction(extraction_deps):
 @pytest.mark.asyncio
 async def test_extraction_flow(pipeline_with_extraction, extraction_deps):
     from dataclasses import asdict
-    ns_id = "tenant:graph-tenant/user:graph-user"
-    ns_cfg = NamespaceConfig(tenant_id="graph-tenant", user_id="graph-user")
+    tenant_id = "graph-tenant"
+    ns_id = f"tenant:{tenant_id}/user:graph-user"
+    ns_cfg = NamespaceConfig(tenant_id=tenant_id, user_id="graph-user")
+    await extraction_deps["kv"].set(f"tenant_config:{tenant_id}", asdict(TenantConfig(tenant_id=tenant_id, text_embedding=EmbeddingModelConfig(provider="mock", model="mock-model", dimension=128))))
     await extraction_deps["kv"].set(f"ns_config:{ns_id}", asdict(ns_cfg))
     
     text = "Alice works at BobCorp. It is a big Company."

@@ -11,15 +11,12 @@ import logging
 from typing import Any, Dict, Optional
 from pathlib import Path
 
-from unified_memory.core.interfaces import EmbeddingProvider
+from unified_memory.embeddings.base import EmbeddingProvider
 from unified_memory.ingestion.extractors.base import Extractor
 from unified_memory.ingestion.parsers.base import DocumentParser
-from unified_memory.ingestion.parsers.registry import (
-    get_parser_registry,
-    ParserRegistry,
-)
-
-logger = logging.getLogger(__name__)
+from unified_memory.ingestion.parsers.registry import ParserRegistry
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class ProviderRegistry:
@@ -38,13 +35,13 @@ class ProviderRegistry:
     instance throughout the process lifetime.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parser_registry: Optional[ParserRegistry] = None) -> None:
         self._embedding_providers: Dict[str, EmbeddingProvider] = {}
         self._vision_embedding_providers: Dict[str, EmbeddingProvider] = {}
         self._llm_providers: Dict[str, Any] = {}
         self._extractors: Dict[str, Extractor] = {}
         self._rerankers: Dict[str, Any] = {}
-        self._parser_registry: ParserRegistry = get_parser_registry()
+        self._parser_registry = parser_registry or ParserRegistry()
 
     # ------------------------------------------------------------------
     # Text embedding providers
@@ -54,7 +51,7 @@ class ProviderRegistry:
         self, key: str, provider: EmbeddingProvider
     ) -> None:
         if key in self._embedding_providers:
-            logger.debug("Embedding provider '%s' already registered, skipping.", key)
+            log_event(logger, logging.DEBUG, "embedding.provider.already_registered", key=key)
             return
         self._embedding_providers[key] = provider
 
@@ -87,9 +84,7 @@ class ProviderRegistry:
         ``"provider:model"`` (e.g. ``"openai:clip-vit-base-patch32"``).
         """
         if key in self._vision_embedding_providers:
-            logger.debug(
-                "Vision embedding provider '%s' already registered, skipping.", key
-            )
+            log_event(logger, logging.DEBUG, "vision.embedding.provider.already_registered", key=key)
             return
         self._vision_embedding_providers[key] = provider
 
@@ -117,7 +112,7 @@ class ProviderRegistry:
 
     def register_llm_provider(self, key: str, provider: Any) -> None:
         if key in self._llm_providers:
-            logger.debug("LLM provider '%s' already registered, skipping.", key)
+            log_event(logger, logging.DEBUG, "llm.provider.already_registered", key=key)
             return
         self._llm_providers[key] = provider
 
@@ -130,7 +125,7 @@ class ProviderRegistry:
 
     def register_extractor(self, key: str, extractor: Any) -> None:
         if key in self._extractors:
-            logger.debug("Extractor '%s' already registered, skipping.", key)
+            log_event(logger, logging.DEBUG, "extractor.already_registered", key=key)
             return
         self._extractors[key] = extractor
 
@@ -143,7 +138,7 @@ class ProviderRegistry:
 
     def register_reranker(self, key: str, reranker: Any) -> None:
         if key in self._rerankers:
-            logger.debug("Reranker '%s' already registered, skipping.", key)
+            log_event(logger, logging.DEBUG, "reranker.already_registered", key=key)
             return
         self._rerankers[key] = reranker
 

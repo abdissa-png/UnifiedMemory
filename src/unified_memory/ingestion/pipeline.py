@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Tuple
 
+from unified_memory.core.exceptions import (
+    ProviderNotFoundError,
+    TenantConfigNotFoundError,
+)
 from unified_memory.core.types import (
     Chunk,
     SourceReference,
@@ -37,7 +41,7 @@ from unified_memory.ingestion.extractors.base import Extractor
 from unified_memory.namespace.manager import NamespaceManager
 from unified_memory.namespace.types import ExtractionConfig
 from unified_memory.cas.document_registry import DocumentRegistry
-from unified_memory.ingestion.parsers.registry import get_parser_registry, ParserRegistry
+from unified_memory.ingestion.parsers.registry import ParserRegistry
 from unified_memory.ingestion.chunkers.fixed_size import FixedSizeChunker, ChunkingConfig
 from unified_memory.ingestion.chunkers.recursive import RecursiveChunker
 from unified_memory.ingestion.chunkers.semantic import SemanticChunker
@@ -238,7 +242,7 @@ class IngestionPipeline:
                     return embedder
         if self._fallback_embedder:
             return self._fallback_embedder
-        raise ValueError(
+        raise ProviderNotFoundError(
             "No embedding provider available for tenant. "
             "Register one in the ProviderRegistry."
         )
@@ -308,6 +312,8 @@ class IngestionPipeline:
         ns_config = await self.namespace_manager.get_config(namespace)
         tenant_id = ns_config.tenant_id if ns_config else "default"
         tenant_config = await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
 
         text_embedding_model = (
             tenant_config.text_embedding.model if tenant_config else "default"
@@ -581,6 +587,8 @@ class IngestionPipeline:
         )
         if not ctx:
             tc = await self.namespace_manager.get_tenant_config(tenant_id)
+            if tc is None:
+                raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
             enable_graph = bool(
                 getattr(tc, "enable_graph_storage", False) if tc else False
             )
@@ -650,6 +658,8 @@ class IngestionPipeline:
             k: v for k, v in tc_dict.items()
             if k in TenantConfig.__dataclass_fields__
         }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
         req_chunker, chunk_cfg = self._build_chunker_for_tenant(tenant_config)
         chunks = await req_chunker.chunk(
             parsed, namespace, tenant_id=tenant_id, config=chunk_cfg
@@ -707,6 +717,8 @@ class IngestionPipeline:
             k: v for k, v in tc_dict.items()
             if k in TenantConfig.__dataclass_fields__
         }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
         embedder = self._resolve_embedder_from_tenant(tenant_config)
 
         text_collection = await self.namespace_manager.get_collection_name(
@@ -1222,6 +1234,8 @@ class IngestionPipeline:
             k: v for k, v in tc_dict.items()
             if k in TenantConfig.__dataclass_fields__
         }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
         embedder = self._resolve_embedder_from_tenant(tenant_config)
 
         if entity_descriptors:
@@ -1397,6 +1411,8 @@ class IngestionPipeline:
             k: v for k, v in tc_dict.items()
             if k in TenantConfig.__dataclass_fields__
         }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
         vision_embedder = self._resolve_vision_embedder_from_tenant(
             tenant_config
         )
@@ -1562,6 +1578,8 @@ class IngestionPipeline:
         ns_config = await self.namespace_manager.get_config(namespace)
         tenant_id = ns_config.tenant_id if ns_config else "default"
         tenant_config = await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
         embedding_model = tenant_config.text_embedding.model if tenant_config else "default"
         raw_ext = tenant_config.extraction if tenant_config else None
         if isinstance(raw_ext, dict):
@@ -2180,6 +2198,8 @@ class IngestionPipeline:
                 return IngestionResult(doc_id, source_ref, errors=[f"Namespace {namespace} not found"])
             
             tenant_config = await self.namespace_manager.get_tenant_config(ns_config.tenant_id)
+            if tenant_config is None:
+                raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_config.tenant_id}")
 
             # options["embedding_model"] is accepted for backward-compatibility
             # logging but NEVER used for hashing or storage decisions.  All
@@ -2406,6 +2426,8 @@ class IngestionPipeline:
                  return IngestionResult(doc_id, source_ref, errors=[f"Namespace {namespace} not found"])
             
             tenant_config = await self.namespace_manager.get_tenant_config(ns_config.tenant_id)
+            if tenant_config is None:
+                raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_config.tenant_id}")
             embedding_model = tenant_config.text_embedding.model
             
             # Phase 1.3: Document Registry Check
