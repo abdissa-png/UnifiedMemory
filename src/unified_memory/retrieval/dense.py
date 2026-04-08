@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from unified_memory.core.types import RetrievalResult, Modality, CollectionType
+from unified_memory.embeddings.base import EmbeddingProvider
 from unified_memory.storage.base import VectorStoreBackend
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.namespace.manager import NamespaceManager
-from unified_memory.core.interfaces import EmbeddingProvider
 from unified_memory.observability.tracing import traced
 
 logger = logging.getLogger(__name__)

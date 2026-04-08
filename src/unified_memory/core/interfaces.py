@@ -7,79 +7,11 @@ Using Protocol (structural subtyping) allows flexibility without inheritance.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Callable, runtime_checkable, Tuple
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from .types import (
-    Chunk,
-    PageContent,
     RetrievalResult,
 )
-
-
-
-@runtime_checkable
-class EmbeddingProvider(Protocol):
-    """
-    Protocol for embedding providers.
-    """
-    
-    @property
-    def dimension(self) -> int:
-        """Embedding dimension."""
-        ...
-        
-    async def embed(
-        self,
-        text: str,
-    ) -> List[float]:
-        """Embed a single string."""
-        ...
-        
-    async def embed_batch(
-        self,
-        texts: List[str],
-    ) -> List[List[float]]:
-        """Embed a batch of strings."""
-        ...
-
-
-@runtime_checkable
-class LLMProvider(Protocol):
-    """
-    Protocol for LLM providers (answer generation, extraction).
-
-    Implementations: OpenAI, Anthropic, local models, etc.
-    """
-
-    @property
-    def model_id(self) -> str:
-        """Unique identifier for the model."""
-        ...
-
-    @property
-    def max_tokens(self) -> int:
-        """Maximum context window size."""
-        ...
-
-    async def generate(
-        self,
-        prompt: str,
-        max_output_tokens: int = 1024,
-        temperature: float = 0.7,
-        stop_sequences: Optional[List[str]] = None,
-    ) -> str:
-        """Generate text completion."""
-        ...
-
-    async def generate_with_images(
-        self,
-        prompt: str,
-        images: List[bytes],
-        max_output_tokens: int = 1024,
-    ) -> str:
-        """Generate with multimodal input (for MLLM)."""
-        ...
 
 
 @runtime_checkable
@@ -153,79 +85,4 @@ class SparseRetriever(Protocol):
         """Delete documents from sparse index. Returns count deleted."""
         ...
 
-
-@runtime_checkable
-class DocumentParser(Protocol):
-    """
-    Protocol for document parsing (PDF, DOCX, HTML).
-
-    Implementations: DocTR, PyMuPDF, Unstructured, etc.
-    """
-
-    @property
-    def supported_formats(self) -> List[str]:
-        """List of supported file extensions."""
-        ...
-
-    async def parse(
-        self,
-        content: bytes,
-        file_type: str,
-        extract_images: bool = True,
-        extract_tables: bool = True,
-    ) -> List[PageContent]:
-        """
-        Parse document into pages with text, images, tables.
-
-        Returns list of PageContent, one per page.
-        """
-        ...
-
-
-@runtime_checkable
-class Chunker(Protocol):
-    """
-    Protocol for text chunking strategies.
-
-    Implementations: SemanticChunker, RecursiveChunker, FixedChunker
-    """
-
-    @property
-    def strategy(self) -> str:
-        """Chunking strategy name."""
-        ...
-
-    @property
-    def chunk_size(self) -> int:
-        """Target chunk size in characters."""
-        ...
-
-    @property
-    def overlap(self) -> int:
-        """Overlap between chunks in characters."""
-        ...
-
-    async def chunk_text(
-        self,
-        text: str,
-        document_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> List[Chunk]:
-        """Chunk a single text into Chunk objects."""
-        ...
-
-    async def chunk_pages(
-        self,
-        pages: List[PageContent],
-        document_id: str,
-    ) -> List[Chunk]:
-        """Chunk multiple pages, preserving page references."""
-        ...
-
-
-
-
-
-# Type alias for chunker factory
-ChunkerFactory = Callable[[str, int, int], Chunker]
 
