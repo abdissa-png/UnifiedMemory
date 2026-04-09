@@ -7,6 +7,10 @@ UNIFIED_MEMORY_SYSTEM_DESIGN.md and INITIAL_PLAN.md.
 
 from __future__ import annotations
 
+from unified_memory.core.exceptions import (
+    NamespaceNotFoundError,
+    TenantConfigNotFoundError,
+)
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
 import hashlib
@@ -355,10 +359,12 @@ class RetrievalConfig:
         # Get namespace config to find tenant
         ns_config = await namespace_manager.get_config(namespace)
         if not ns_config:
-            raise ValueError(f"Namespace not found: {namespace}")
+            raise NamespaceNotFoundError(f"Namespace not found: {namespace}")
 
         # Get tenant config for defaults
         tenant_config = await namespace_manager.get_tenant_config(ns_config.tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_config.tenant_id}")
         
         request = request_options or {}
         

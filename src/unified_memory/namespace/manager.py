@@ -10,10 +10,19 @@ Handles:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
 
+from unified_memory.core.exceptions import (
+    CASConflictError,
+    ConfigurationError,
+    NamespaceNotFoundError,
+    TenantNotFoundError,
+    TenantConfigNotFoundError,
+    TenantConfigConflictError,
+)
 from unified_memory.core.types import (
     CollectionType,
     Modality,
@@ -48,6 +57,10 @@ class NamespaceManager:
     - Provides embedding model lookup via TenantConfig
     - Handles multi-tenant scenarios
     - Uses request-scoped cache to avoid repeated KV lookups
+
+    The namespace and tenant caches are scoped to the current async context,
+    typically a single request. A ``LookupError`` means the cache has not yet
+    been initialized for that context.
     """
 
     def __init__(
@@ -86,6 +99,17 @@ class NamespaceManager:
         config = NamespaceConfig(**data)
         cache[namespace] = config
         return config
+
+    def invalidate_cache(self, namespace_id: Optional[str] = None) -> None:
+        """Clear the request-scoped namespace cache."""
+        try:
+            cache = _request_namespace_cache.get()
+            if namespace_id:
+                cache.pop(namespace_id, None)
+            else:
+                cache.clear()
+        except LookupError:
+            pass
 
     async def create_namespace(
         self,
@@ -128,7 +152,7 @@ class NamespaceManager:
         # Check if namespace already exists
         existing_config = await self.get_config(config.namespace_id)
         if existing_config:
-            raise ValueError(f"Namespace already exists: {config.namespace_id}")
+            raise ConfigurationError(f"Namespace already exists: {config.namespace_id}")
 
         await self._save_config(config)
 
@@ -161,7 +185,7 @@ class NamespaceManager:
         """Grant *target_user_id* the given permissions on *namespace_id*."""
         config = await self.get_config(namespace_id)
         if not config:
-            raise ValueError(f"Namespace not found: {namespace_id}")
+            raise NamespaceNotFoundError(f"Namespace not found: {namespace_id}")
 
         config.acl.entries.append(
             ACLEntry(
@@ -192,7 +216,7 @@ class NamespaceManager:
         """Revoke all permissions for *target_user_id* on *namespace_id*."""
         config = await self.get_config(namespace_id)
         if not config:
-            raise ValueError(f"Namespace not found: {namespace_id}")
+            raise NamespaceNotFoundError(f"Namespace not found: {namespace_id}")
 
         config.acl.entries = [
             e
@@ -244,12 +268,7 @@ class NamespaceManager:
                     add=False,
                 )
 
-        # Invalidate cache
-        try:
-            cache = _request_namespace_cache.get()
-            cache.pop(namespace_id, None)
-        except LookupError:
-            pass
+        self.invalidate_cache(namespace_id)
 
         return True
 
@@ -267,20 +286,22 @@ class NamespaceManager:
 
         config = await self.get_config(namespace)
         if not config:
-            raise ValueError(f"Namespace {namespace} not found")
+            raise NamespaceNotFoundError(f"Namespace {namespace} not found")
 
         tenant_cfg = await self.get_tenant_config(config.tenant_id)
+        if not tenant_cfg:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {config.tenant_id}")
         if modality in (Modality.TEXT, Modality.SHARED):
             return tenant_cfg.text_embedding
         if modality in (Modality.IMAGE, Modality.DOCUMENT):
             if not tenant_cfg.vision_embedding:
-                raise ValueError(
+                raise ConfigurationError(
                     f"Vision embedding not configured for tenant {config.tenant_id}"
                 )
             return tenant_cfg.vision_embedding
         return tenant_cfg.text_embedding
 
-    async def get_tenant_config(self, tenant_id: str) -> TenantConfig:
+    async def get_tenant_config(self, tenant_id: str) -> Optional[TenantConfig]:
         """
         Get tenant-level configuration.
 
@@ -300,14 +321,7 @@ class NamespaceManager:
 
         versioned = await self.kv_store.get(f"tenant_config:{tenant_id}")
         if not versioned:
-            # Derive default tenant config if missing
-            cfg = TenantConfig(
-                tenant_id=tenant_id,
-                updated_at=utc_now().isoformat(),
-            )
-            await self.kv_store.set(f"tenant_config:{tenant_id}", asdict(cfg))
-            cache[tenant_id] = cfg
-            return cfg
+            return None
 
         data = versioned.data
         # Handle nested dataclasses - ensure we convert dicts to objects
@@ -326,6 +340,36 @@ class NamespaceManager:
         cache[tenant_id] = cfg
         return cfg
 
+    async def get_or_create_tenant_config(self, tenant_id: str) -> TenantConfig:
+        """Read tenant config, creating the default record explicitly if missing."""
+        cfg = await self.get_tenant_config(tenant_id)
+        if cfg is not None:
+            return cfg
+
+        cfg = TenantConfig(
+            tenant_id=tenant_id,
+            updated_at=utc_now().isoformat(),
+        )
+
+        for attempt in range(5):
+            if await self.kv_store.set_if_not_exists(f"tenant_config:{tenant_id}", asdict(cfg)):
+                try:
+                    cache = _request_tenant_cache.get()
+                except LookupError:
+                    cache = {}
+                    _request_tenant_cache.set(cache)
+                cache[tenant_id] = cfg
+                return cfg
+
+            existing = await self.get_tenant_config(tenant_id)
+            if existing is not None:
+                return existing
+            await asyncio.sleep(0.01 * (attempt + 1))
+
+        raise CASConflictError(
+            f"CAS failed after 5 attempts on tenant_config:{tenant_id}"
+        )
+
     async def get_collection_name(
         self,
         namespace: str,
@@ -335,7 +379,7 @@ class NamespaceManager:
 
         config = await self.get_config(namespace)
         if not config:
-            raise ValueError(f"Namespace {namespace} not found")
+            raise NamespaceNotFoundError(f"Namespace {namespace} not found")
 
         mapping = {
             CollectionType.TEXTS: config.text_collection,
@@ -397,29 +441,38 @@ class NamespaceManager:
         """
 
         key = f"idx:user_namespaces:{tenant_id}:{user_id}"
-        versioned = await self.kv_store.get(key)
-        data = versioned.data if versioned else {"namespaces": []}
-        ns_set = set(data.get("namespaces", []))
-        if add:
-            ns_set.add(namespace_id)
-        else:
-            ns_set.discard(namespace_id)
-        data["namespaces"] = list(ns_set)
-        await self.kv_store.set(key, data)
+        await self._update_namespace_index(key, namespace_id, add=add)
 
     async def _save_config(self, config: NamespaceConfig) -> None:
         """Persist a NamespaceConfig with proper ACL serialisation."""
         data = asdict(config)
         # Replace the raw asdict ACL (which keeps Enum objects) with a safe dict
         data["acl"] = config.acl.to_dict()
-        await self.kv_store.set(f"ns_config:{config.namespace_id}", data)
+        key = f"ns_config:{config.namespace_id}"
 
-        # Invalidate cache entry so next get_config sees the update
-        try:
-            cache = _request_namespace_cache.get()
-            cache[config.namespace_id] = config
-        except LookupError:
-            pass
+        for attempt in range(5):
+            versioned = await self.kv_store.get(key)
+            if versioned is None:
+                if await self.kv_store.set_if_not_exists(key, data):
+                    try:
+                        cache = _request_namespace_cache.get()
+                    except LookupError:
+                        cache = {}
+                        _request_namespace_cache.set(cache)
+                    cache[config.namespace_id] = config
+                    return
+            elif await self.kv_store.compare_and_swap(key, versioned.version, data):
+                try:
+                    cache = _request_namespace_cache.get()
+                except LookupError:
+                    cache = {}
+                    _request_namespace_cache.set(cache)
+                cache[config.namespace_id] = config
+                return
+
+            await asyncio.sleep(0.01 * (attempt + 1))
+
+        raise CASConflictError(f"CAS failed after 5 attempts on {key}")
 
     async def _update_acl_access_index(
         self,
@@ -430,15 +483,7 @@ class NamespaceManager:
     ) -> None:
         """Maintain the idx:acl_access:{tenant}:{user} index."""
         key = f"idx:acl_access:{tenant_id}:{user_id}"
-        versioned = await self.kv_store.get(key)
-        data = versioned.data if versioned else {"namespaces": []}
-        ns_set = set(data.get("namespaces", []))
-        if add:
-            ns_set.add(namespace_id)
-        else:
-            ns_set.discard(namespace_id)
-        data["namespaces"] = list(ns_set)
-        await self.kv_store.set(key, data)
+        await self._update_namespace_index(key, namespace_id, add=add)
 
     async def _update_public_namespace_index(
         self,
@@ -454,14 +499,35 @@ class NamespaceManager:
         """
 
         key = f"idx:public_namespaces:{tenant_id}"
-        versioned = await self.kv_store.get(key)
-        data = versioned.data if versioned else {"namespaces": []}
-        ns_set = set(data.get("namespaces", []))
-        if add:
-            ns_set.add(namespace_id)
-        else:
-            ns_set.discard(namespace_id)
-        data["namespaces"] = list(ns_set)
-        await self.kv_store.set(key, data)
+        await self._update_namespace_index(key, namespace_id, add=add)
+
+    async def _update_namespace_index(
+        self,
+        key: str,
+        namespace_id: str,
+        *,
+        add: bool,
+    ) -> None:
+        """Update an index entry with CAS retries."""
+        for attempt in range(5):
+            versioned = await self.kv_store.get(key)
+            if versioned is None:
+                data = {"namespaces": [namespace_id] if add else []}
+                if await self.kv_store.set_if_not_exists(key, data):
+                    return
+            else:
+                data = dict(versioned.data)
+                ns_set = set(data.get("namespaces", []))
+                if add:
+                    ns_set.add(namespace_id)
+                else:
+                    ns_set.discard(namespace_id)
+                data["namespaces"] = list(ns_set)
+                if await self.kv_store.compare_and_swap(key, versioned.version, data):
+                    return
+
+            await asyncio.sleep(0.01 * (attempt + 1))
+
+        raise CASConflictError(f"CAS failed after 5 attempts on {key}")
 
 

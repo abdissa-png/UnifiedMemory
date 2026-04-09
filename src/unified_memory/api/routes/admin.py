@@ -13,6 +13,7 @@ from unified_memory.api.schemas import (
     UpdateTenantConfigRequest,
 )
 from unified_memory.auth.jwt_handler import AuthenticatedUser
+from unified_memory.core.exceptions import TenantConfigNotFoundError
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 
@@ -67,7 +68,9 @@ async def get_tenant_config(
     if user.tenant_id != tenant_id:
         raise HTTPException(403, "Cross-tenant access denied")
 
-    cfg = await ctx.namespace_manager.get_tenant_config(tenant_id)
+    cfg = await ctx.tenant_manager.get_tenant_config(tenant_id)
+    if not cfg:
+        raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
     return _cfg_to_response(cfg)
 
 
@@ -82,7 +85,9 @@ async def update_tenant_config(
     if user.tenant_id != tenant_id:
         raise HTTPException(403, "Cross-tenant access denied")
 
-    cfg = await ctx.namespace_manager.get_tenant_config(tenant_id)
+    cfg = await ctx.tenant_manager.get_tenant_config(tenant_id)
+    if not cfg:
+        raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
 
     # Simple scalar overrides
     for field in (

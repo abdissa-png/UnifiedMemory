@@ -15,18 +15,22 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from unified_memory.core.exceptions import (
+    ProviderNotFoundError,
+    TenantConfigNotFoundError,
+)
 from unified_memory.core.json_utils import validate_and_repair_json
 from unified_memory.core.tokenizer import ContextWindowManager
 from unified_memory.observability.tracing import traced
-
+from unified_memory.core.logging import get_logger,log_event
 if TYPE_CHECKING:
     from unified_memory.retrieval.unified import UnifiedSearchService
     from unified_memory.llm.base import BaseLLMProvider
     from unified_memory.storage.sql.session_manager import ChatSessionManager
     from unified_memory.namespace.manager import NamespaceManager
-    from unified_memory.llm.provider_registry import ProviderRegistry
+    from unified_memory.core.registry import ProviderRegistry
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_ITERATIONS = 3
 
@@ -62,18 +66,19 @@ class QAAgent:
         tenant_cfg = None
         if ns_cfg:
             tenant_cfg = await self.namespace_manager.get_tenant_config(ns_cfg.tenant_id)
+            if tenant_cfg is None:
+                raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_cfg.tenant_id}"    )
 
         llm = None
         if tenant_cfg and tenant_cfg.llm:
-            try:
-                llm = self.provider_registry.get_llm_provider(f"{tenant_cfg.llm.get('provider')}:{tenant_cfg.llm.get('model')}")
-            except ValueError:
-                pass
+            llm = self.provider_registry.get_llm_provider(
+                f"{tenant_cfg.llm.get('provider')}:{tenant_cfg.llm.get('model')}"
+            )
         
         if not llm:
             llm_providers = list(getattr(self.provider_registry, "_llm_providers", {}).values())
             if not llm_providers:
-                raise ValueError("No LLM providers available")
+                raise ProviderNotFoundError("No LLM providers available")
             llm = llm_providers[0]
 
         # Determine which paths are actually available
@@ -181,6 +186,8 @@ class QAAgent:
         tenant_config = None
         if ns_cfg:
             tenant_config = await self.namespace_manager.get_tenant_config(ns_cfg.tenant_id)
+            if tenant_config is None:
+                raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_cfg.tenant_id}")
 
         if self.search_service.dense_retriever is not None:
             paths.append("dense")

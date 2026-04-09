@@ -6,15 +6,18 @@ Manages tenant configurations, particularly embedding models.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from typing import Optional
 
+from unified_memory.core.exceptions import CASConflictError
 from unified_memory.storage.base import KVStoreBackend
 from unified_memory.namespace.types import TenantConfig, EmbeddingModelConfig
 from unified_memory.core.types import Modality
 
-logger = logging.getLogger(__name__)
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class TenantManager:
@@ -52,7 +55,17 @@ class TenantManager:
         
     async def set_tenant_config(self, tenant_id: str, config: TenantConfig) -> None:
         """Store tenant configuration."""
-        await self.kv_store.set(self._key(tenant_id), asdict(config))
+        key = self._key(tenant_id)
+        payload = asdict(config)
+        for attempt in range(5):
+            versioned = await self.kv_store.get(key)
+            if versioned is None:
+                if await self.kv_store.set_if_not_exists(key, payload):
+                    return
+            elif await self.kv_store.compare_and_swap(key, versioned.version, payload):
+                return
+            await asyncio.sleep(0.01 * (attempt + 1))
+        raise CASConflictError(f"CAS failed after 5 attempts on {key}")
         
     async def get_embedding_model_id(
         self, 
@@ -70,6 +83,12 @@ class TenantManager:
         system_default_image = "clip-vit-base-patch32"
         
         if not config:
+            log_event(logger, logging.WARNING, "tenant.embedding.model.not_found",
+                tenant_id=tenant_id,
+                modality=modality,
+                system_default_text=system_default_text,
+                system_default_image=system_default_image,
+            )
             return system_default_text if modality == Modality.TEXT else system_default_image
             
         if modality == Modality.TEXT:

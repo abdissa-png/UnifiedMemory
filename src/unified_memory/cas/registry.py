@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 import asyncio
 
+from unified_memory.core.exceptions import CASConflictError
 from unified_memory.core.types import utc_now
 from unified_memory.storage.base import KVStoreBackend
 
@@ -171,7 +172,7 @@ class CASRegistry:
             # Version mismatch - retry with backoff
             await asyncio.sleep(0.01 * (attempt + 1))
             
-        return False
+        raise CASConflictError(f"CAS failed after 5 attempts on {key}")
 
     async def remove_reference(
         self,
@@ -216,7 +217,7 @@ class CASRegistry:
                 
             await asyncio.sleep(0.01 * (attempt + 1))
             
-        return False
+        raise CASConflictError(f"CAS failed after 5 attempts on {key}")
     
     async def delete_if_orphan(self, content_hash: str) -> bool:
         """

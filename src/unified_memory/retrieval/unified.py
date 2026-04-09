@@ -8,6 +8,13 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import logging
 
+from unified_memory.core.exceptions import (
+    BackendTransientError,
+    ConfigurationError,
+    NamespaceNotFoundError,
+    ProviderNotFoundError,
+    TenantConfigNotFoundError,
+)
 from unified_memory.core.types import (
     RetrievalResult, QueryResult, Modality, CollectionType, MemoryStatus
 )
@@ -22,8 +29,9 @@ from .dense import DenseRetriever
 from .graph import GraphRetriever
 from .fusion import normalize_scores, reciprocal_rank_fusion, linear_fusion
 from unified_memory.observability.tracing import traced
+from unified_memory.core.logging import get_logger,log_event
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class UnifiedSearchService:
@@ -87,11 +95,11 @@ class UnifiedSearchService:
         # 2. Get Embedding Provider (Tenant-Wide)
         ns_config = await self.namespace_manager.get_config(namespace)
         if not ns_config:
-            raise ValueError(f"Namespace not found: {namespace}")
+            raise NamespaceNotFoundError(f"Namespace not found: {namespace}")
             
-        tenant_config = await self.namespace_manager.get_tenant_config(
-            ns_config.tenant_id
-        )
+        tenant_config = await self.namespace_manager.get_tenant_config(ns_config.tenant_id)
+        if tenant_config is None:
+            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {ns_config.tenant_id}")
 
         model_cfg = tenant_config.text_embedding
         provider_key = f"{model_cfg.provider}:{model_cfg.model}"
@@ -100,7 +108,7 @@ class UnifiedSearchService:
             model_cfg.provider, model_cfg.model,
         )
         if embedder is None:
-            raise ValueError(
+            raise ProviderNotFoundError(
                 f"No embedding provider found for '{provider_key}'. "
                 "Register one in the ProviderRegistry."
             )
@@ -152,7 +160,7 @@ class UnifiedSearchService:
         # Dense Path
         if "dense" in config.paths:
             if self.dense_retriever is None:
-                raise ValueError("DenseRetriever not configured")
+                raise ConfigurationError("DenseRetriever not configured")
             tasks.append(
                 self._safe_execute(
                     self.dense_retriever.retrieve(
@@ -170,7 +178,7 @@ class UnifiedSearchService:
         # Graph Path
         if "graph" in config.paths:
             if self.graph_retriever is None:
-                raise ValueError("GraphRetriever not configured")
+                raise ConfigurationError("GraphRetriever not configured")
             tasks.append(
                 self._safe_execute(
                     self.graph_retriever.retrieve(
@@ -234,7 +242,7 @@ class UnifiedSearchService:
             weights = config.fusion_weights or default_weights
             fused = linear_fusion(normalized, weights=weights, normalize_first=True)
         else:
-            raise ValueError(f"Unknown fusion method: {config.fusion_method}")
+            raise ConfigurationError(f"Unknown fusion method: {config.fusion_method}")
             
         # Before reranking, ensure all candidates have content where possible
         # by hydrating from content_store using content_hash if present.
@@ -249,7 +257,7 @@ class UnifiedSearchService:
                 if content:
                     r.content = content
             except Exception as e:
-                logger.warning(f"Failed to hydrate content for hash {content_hash}: {e}")
+                log_event(logger, logging.WARNING, "retrieval.content.hydration.failed", content_hash=content_hash, error=e)
 
         if config.rerank:
             reranker_key = getattr(config, "reranker_key", "default")
@@ -266,8 +274,13 @@ class UnifiedSearchService:
         """Execute a retrieval path safely, logging errors."""
         try:
             return await coroutine
+        except (ConfigurationError, ProviderNotFoundError, NamespaceNotFoundError):
+            raise
+        except BackendTransientError as exc:
+            log_event(logger, logging.WARNING, "retrieval.transient.error", source_name=source_name, error=exc)
+            return []
         except Exception as e:
-            logger.error(f"Error in {source_name} retrieval: {e}", exc_info=True)
+            log_event(logger, logging.ERROR, "retrieval.error", source_name=source_name, error=e)
             return []
 
     @staticmethod
@@ -292,11 +305,7 @@ class UnifiedSearchService:
                 # Namespace is always handled separately at the store level.
                 continue
             if allowed and k not in allowed:
-                logger.warning(
-                    "Filter key '%s' not supported by %s; dropping from request.",
-                    k,
-                    store_name,
-                )
+                log_event(logger, logging.WARNING, "retrieval.filter.not.supported", key=k, store_name=store_name)
                 continue
             cleaned[k] = v
         return cleaned or None
