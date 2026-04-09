@@ -10,6 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from unified_memory.core.logging import bind_log_context, clear_log_context
 from unified_memory.observability.tracing import set_request_context
 
 
@@ -22,7 +23,11 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
         # Tenant / namespace are set after auth resolves
         set_request_context(tenant_id="", namespace="")
+        bind_log_context(tenant_id="", namespace="")
 
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
+        finally:
+            clear_log_context()

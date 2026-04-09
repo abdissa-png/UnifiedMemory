@@ -13,8 +13,8 @@ import json
 from typing import Any, Dict, Optional
 
 from unified_memory.core.utils import utc_now
-
-logger = logging.getLogger(__name__)
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class AuditLogger:
@@ -42,16 +42,15 @@ class AuditLogger:
         outcome: str = "success",
     ) -> None:
         if self._session_factory is None:
-            logger.info(
-                "audit.event",
-                extra={
-                    "tenant_id": tenant_id,
-                    "user_id": user_id,
-                    "action": action,
-                    "resource_type": resource_type,
-                    "resource_id": resource_id,
-                    "outcome": outcome,
-                },
+            log_event(logger, logging.INFO, "audit.event",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                details=details,
+                ip_address=ip_address,
+                outcome=outcome,
             )
             return
 
@@ -72,5 +71,15 @@ class AuditLogger:
                 )
                 db.add(event)
                 await db.commit()
-        except Exception:
-            logger.exception("Failed to write audit event to SQL")
+        except Exception as e:
+            log_event(logger, logging.ERROR, "audit.event.failed",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                details=details,
+                ip_address=ip_address,
+                outcome=outcome,
+                error=str(e),
+            )

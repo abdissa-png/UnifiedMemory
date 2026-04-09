@@ -7,10 +7,12 @@ Requires ``python-jose[cryptography]``.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AuthenticatedUser:
@@ -51,9 +53,9 @@ def decode_access_token(
     algorithm: str = "HS256",
 ) -> Optional[AuthenticatedUser]:
     """Return an ``AuthenticatedUser`` or ``None`` on any failure."""
-    try:
-        from jose import jwt, JWTError
+    from jose import JWTError, jwt
 
+    try:
         payload = jwt.decode(token, secret, algorithms=[algorithm])
         return AuthenticatedUser(
             user_id=payload["sub"],
@@ -61,5 +63,8 @@ def decode_access_token(
             email=payload.get("email", ""),
             roles=json.loads(payload.get("roles", "[]")),
         )
-    except Exception:
+    except (JWTError, KeyError, json.JSONDecodeError):
+        return None
+    except Exception as exc:
+        logger.warning("Unexpected JWT decode failure: %s", exc)
         return None

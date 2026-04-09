@@ -13,7 +13,8 @@ import asyncio
 from unified_memory.core.interfaces import Reranker
 from unified_memory.core.types import RetrievalResult
 
-logger = logging.getLogger(__name__)
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 class CohereReranker:
     """
@@ -53,17 +54,6 @@ class CohereReranker:
             documents.append(content)
             
         try:
-            # Cohere API call (synchronous, run in executor)
-            # loop = asyncio.get_event_loop()
-            # response = await loop.run_in_executor(
-            #     None,
-            #     lambda: self.client.rerank(
-            #         model=self._model_id,
-            #         query=query,
-            #         documents=documents,
-            #         top_n=top_k,
-            #     )
-            # )
             response = await self.client.rerank(
                     model=self._model_id,
                     query=query,
@@ -95,8 +85,26 @@ class CohereReranker:
             return reranked
             
         except Exception as e:
-            logger.error(f"Cohere reranking failed: {e}")
-            return results[:top_k] # Fallback to original order
+            log_event(logger, logging.ERROR, "cohere.reranking.failed", error=str(e))
+            fallback_results: List[RetrievalResult] = []
+            for original in results[:top_k]:
+                metadata = dict(original.metadata)
+                metadata["rerank_skipped"] = True
+                fallback_results.append(
+                    RetrievalResult(
+                        id=original.id,
+                        content=original.content,
+                        score=original.score,
+                        metadata=metadata,
+                        source=original.source,
+                        evidence_type=original.evidence_type,
+                        entity_ids=original.entity_ids,
+                        relation_ids=original.relation_ids,
+                        page_number=original.page_number,
+                        modality=original.modality,
+                    )
+                )
+            return fallback_results
 
     def _record_rerank_usage(self, response) -> None:
         try:
@@ -117,8 +125,8 @@ class CohereReranker:
                     search_units=int(getattr(billed, "search_units", 0) or 0),
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(logger, logging.DEBUG, "cohere.reranking.usage.failed", error=str(exc))
 
 
 class BGEReranker:
@@ -132,7 +140,7 @@ class BGEReranker:
         except ImportError:
             raise ImportError("BGE support requires 'sentence-transformers': pip install sentence-transformers")
             
-        logger.info(f"Loading BGE reranker model: {model_name}")
+        log_event(logger, logging.INFO, "bge.reranker.loading", model_name=model_name)
         self.model = CrossEncoder(model_name)
         self._model_id = model_name
         

@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from unified_memory.core.logging import bind_log_context
 from unified_memory.core.utils import utc_now
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,7 @@ def set_request_context(*, tenant_id: str = "", namespace: str = "") -> None:
         _request_tenant_id.set(tenant_id)
     if namespace:
         _request_namespace.set(namespace)
+    bind_log_context(tenant_id=tenant_id, namespace=namespace)
 
 
 def record_usage(record: UsageRecord) -> None:
