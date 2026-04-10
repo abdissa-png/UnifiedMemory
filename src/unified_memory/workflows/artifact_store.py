@@ -21,7 +21,9 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from unified_memory.core.config import DEFAULT_ARTIFACT_DIR
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class ArtifactStore(ABC):
@@ -57,7 +59,7 @@ class LocalFSArtifactStore(ArtifactStore):
 
     SCHEME = "local"
 
-    def __init__(self, base_dir: str = "/tmp/memory_artifacts") -> None:
+    def __init__(self, base_dir: str = DEFAULT_ARTIFACT_DIR) -> None:
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
 

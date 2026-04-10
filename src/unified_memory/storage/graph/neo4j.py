@@ -11,6 +11,7 @@ from collections import defaultdict
 
 from neo4j import AsyncGraphDatabase
 
+from unified_memory.core.config import DEFAULT_NEO4J_URI
 from unified_memory.storage.base import GraphStoreBackend, GraphNode, GraphEdge
 from unified_memory.core.types import (
     EntityNode,
@@ -31,7 +32,7 @@ class Neo4jGraphStore(GraphStoreBackend):
     
     def __init__(
         self,
-        uri: str = "bolt://localhost:7687",
+        uri: str = DEFAULT_NEO4J_URI,
         auth: Optional[Tuple[str, str]] = ("neo4j", "password"),
     ):
         self.driver = AsyncGraphDatabase.driver(uri, auth=auth)

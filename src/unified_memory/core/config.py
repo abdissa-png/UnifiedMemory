@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import os
 
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+DEFAULT_QDRANT_URL = "http://localhost:6333"
+DEFAULT_NEO4J_URI = "bolt://localhost:7687"
+DEFAULT_ELASTICSEARCH_URL = "http://localhost:9200"
+DEFAULT_ARTIFACT_DIR = "/tmp/memory_artifacts"
+
 
 @dataclass
 class SystemConfig:
@@ -111,19 +117,19 @@ class InfraConfig:
     """
 
     kv_store: str = "memory"  # "memory" | "redis"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = DEFAULT_REDIS_URL
 
     vector_store: str = "memory"  # "memory" | "qdrant"
-    qdrant_url: str = "http://localhost:6333"
+    qdrant_url: str = DEFAULT_QDRANT_URL
     qdrant_api_key: Optional[str] = None
 
     graph_store: str = "networkx"  # "networkx" | "neo4j"
-    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_uri: str = DEFAULT_NEO4J_URI
     neo4j_auth_user: str = "neo4j"
     neo4j_auth_password: str = "password"
 
     sparse_retriever: str = "bm25"  # "bm25" | "elasticsearch"
-    elasticsearch_url: str = "http://localhost:9200"
+    elasticsearch_url: str = DEFAULT_ELASTICSEARCH_URL
     elasticsearch_index: str = "unified_memory_content"
     elasticsearch_api_key: Optional[str] = None
 

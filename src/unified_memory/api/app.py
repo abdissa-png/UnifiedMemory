@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    await ctx.close()
     await sql_engine.dispose()
     logger.info("Unified Memory System stopped")
 
@@ -140,9 +142,47 @@ def create_app() -> FastAPI:
             except ImportError:
                 logger.warning("inngest.fast_api not available; skipping")
 
-    @app.get("/health")
-    async def health():
+    @app.get("/health/live")
+    async def health_live():
         return {"status": "ok"}
+
+    @app.get("/health")
+    @app.get("/health/ready")
+    async def health_ready():
+        ctx = app.state.system_context
+        checks: dict[str, str] = {}
+
+        try:
+            await ctx.kv_store.get("__health_probe__")
+            checks["kv"] = "ok"
+        except Exception as exc:
+            checks["kv"] = f"error:{type(exc).__name__}"
+
+        try:
+            await ctx.vector_store.list_collections(prefix="__health__")
+            checks["vector"] = "ok"
+        except Exception as exc:
+            checks["vector"] = f"error:{type(exc).__name__}"
+
+        try:
+            await ctx.graph_store.query_nodes({}, namespace=None, limit=1)
+            checks["graph"] = "ok"
+        except Exception as exc:
+            checks["graph"] = f"error:{type(exc).__name__}"
+
+        if ctx.elasticsearch_store is not None:
+            try:
+                ping_result = await ctx.elasticsearch_store._es.ping()
+                checks["elasticsearch"] = "ok" if ping_result else "error:ping_failed"
+            except Exception as exc:
+                checks["elasticsearch"] = f"error:{type(exc).__name__}"
+
+        overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+        status_code = 200 if overall == "ok" else 503
+        return JSONResponse(
+            {"status": overall, "checks": checks},
+            status_code=status_code,
+        )
 
     return app
 

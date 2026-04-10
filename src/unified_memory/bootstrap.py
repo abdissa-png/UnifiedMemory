@@ -13,19 +13,29 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 from pathlib import Path
 
 from unified_memory.core.registry import ProviderRegistry
 from unified_memory.core.config import (
     AppConfig,
+    DEFAULT_ARTIFACT_DIR,
+    DEFAULT_ELASTICSEARCH_URL,
+    DEFAULT_NEO4J_URI,
+    DEFAULT_QDRANT_URL,
+    DEFAULT_REDIS_URL,
     load_app_config,
     app_config_to_dict,
     validate_config_compatibility,
 )
+from unified_memory.core.exceptions import (
+    ConfigurationError,
+    ProviderNotFoundError,
+)
 from unified_memory.cas.registry import CASRegistry
 from unified_memory.cas.content_store import ContentStore
 from unified_memory.cas.document_registry import DocumentRegistry
+from unified_memory.ingestion.parsers.registry import ParserRegistry
 from unified_memory.namespace.manager import NamespaceManager
 from unified_memory.storage.kv.memory_store import MemoryKVStore
 from unified_memory.storage.vector.memory_store import MemoryVectorStore
@@ -37,6 +47,11 @@ from unified_memory.retrieval.graph import GraphRetriever
 from unified_memory.namespace.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from unified_memory.agents.qa_agent import QAAgent
+    from unified_memory.observability.audit import AuditLogger
+    from unified_memory.storage.sql.session_manager import ChatSessionManager
 
 
 class SystemContext:
@@ -74,8 +89,9 @@ class SystemContext:
         self.cas_registry = CASRegistry(self.kv_store)
         self.document_registry = DocumentRegistry(self.kv_store)
         self.namespace_manager = NamespaceManager(self.kv_store)
+        self.parser_registry = ParserRegistry()
 
-        self.provider_registry = ProviderRegistry()
+        self.provider_registry = ProviderRegistry(parser_registry=self.parser_registry)
 
         # Optional ElasticSearch store (used as both content store and sparse retriever)
         self.elasticsearch_store = None
@@ -88,12 +104,12 @@ class SystemContext:
 
         self.ingestion_pipeline: Optional[IngestionPipeline] = None
         self.search_service: Optional[UnifiedSearchService] = None
-        self.qa_agent = None
+        self.qa_agent: Optional["QAAgent"] = None
 
         # Set by API lifespan when SQL is configured
-        self.sql_session_factory = None
-        self.chat_session_manager = None
-        self.audit_logger = None
+        self.sql_session_factory: Optional[Callable[..., Any]] = None
+        self.chat_session_manager: Optional["ChatSessionManager"] = None
+        self.audit_logger: Optional["AuditLogger"] = None
 
     # ------------------------------------------------------------------
     # Alternate constructors / hot reload
@@ -107,7 +123,7 @@ class SystemContext:
         app_cfg = load_app_config(Path(path))
         errors = validate_config_compatibility(app_cfg)
         if errors:
-            raise ValueError(
+            raise ConfigurationError(
                 "Invalid application configuration:\n" + "\n".join(f"- {e}" for e in errors)
             )
         raw = app_config_to_dict(app_cfg)
@@ -127,7 +143,7 @@ class SystemContext:
         app_cfg = load_app_config(Path(path))
         errors = validate_config_compatibility(app_cfg)
         if errors:
-            raise ValueError(
+            raise ConfigurationError(
                 "Invalid application configuration for hot reload:\n"
                 + "\n".join(f"- {e}" for e in errors)
             )
@@ -142,14 +158,15 @@ class SystemContext:
                 or old.graph_store != new.graph_store
                 or old.sparse_retriever != new.sparse_retriever
             ):
-                raise ValueError(
+                raise ConfigurationError(
                     "Hot reload cannot change infrastructure backends "
                     "(kv_store, vector_store, graph_store, sparse_retriever)."
                 )
 
         # Rebuild provider registry and services using the new config while
         # keeping existing stores.
-        self.provider_registry = ProviderRegistry()
+        self.parser_registry = ParserRegistry()
+        self.provider_registry = ProviderRegistry(parser_registry=self.parser_registry)
         raw = app_config_to_dict(app_cfg)
         self._register_providers(raw)
         self.build_services()
@@ -190,9 +207,28 @@ class SystemContext:
             default_text_embedder = self.provider_registry.get_embedding_provider(
                 default_text_embedding_key
             )
+            if default_text_embedder is None:
+                raise ProviderNotFoundError(
+                    f"Embedding provider '{default_text_embedding_key}' is not registered."
+                )
         if default_vision_embedding_key:
             default_vision_embedder = self.provider_registry.get_vision_embedding_provider(
                 default_vision_embedding_key
+            )
+            if default_vision_embedder is None:
+                # Keep compatibility with existing configs/tests that reuse a
+                # text embedder as the default vision provider key.
+                default_vision_embedder = self.provider_registry.get_embedding_provider(
+                    default_vision_embedding_key
+                )
+            if default_vision_embedder is None:
+                raise ProviderNotFoundError(
+                    f"Vision embedding provider '{default_vision_embedding_key}' is not registered."
+                )
+
+        if not self.provider_registry._embedding_providers and default_text_embedder is None:
+            raise ConfigurationError(
+                "build_services() requires at least one text embedding provider."
             )
 
         sparse_retriever = self.elasticsearch_store
@@ -219,7 +255,7 @@ class SystemContext:
         from unified_memory.cas.image_content_store import LocalFSImageContentStore
         from unified_memory.cas.document_content_store import LocalFSDocumentContentStore
 
-        _base = artifact_store_dir or "/tmp/memory_artifacts"
+        _base = artifact_store_dir or DEFAULT_ARTIFACT_DIR
         self._artifact_store = LocalFSArtifactStore(base_dir=_base)
         self._image_content_store = LocalFSImageContentStore(
             base_dir=os.path.join(_base, "images")
@@ -276,6 +312,33 @@ class SystemContext:
                 session_manager=self.chat_session_manager,
             )
             logger.info("QA agent initialised")
+
+    def require_ingestion_pipeline(self) -> IngestionPipeline:
+        """Return the ingestion pipeline or raise when services are not built."""
+        if self.ingestion_pipeline is None:
+            raise ConfigurationError("build_services() must be called first")
+        return self.ingestion_pipeline
+
+    def require_search_service(self) -> UnifiedSearchService:
+        """Return the search service or raise when services are not built."""
+        if self.search_service is None:
+            raise ConfigurationError("build_services() must be called first")
+        return self.search_service
+
+    def require_qa_agent(self) -> "QAAgent":
+        """Return the QA agent or raise when services are not built."""
+        if self.qa_agent is None:
+            raise ConfigurationError("build_services() must be called first")
+        return self.qa_agent
+
+    async def close(self) -> None:
+        """Tear down all backend connections."""
+        await self.kv_store.close()
+        await self.vector_store.close()
+        if hasattr(self.graph_store, "close"):
+            await self.graph_store.close()
+        if self.elasticsearch_store is not None:
+            await self.elasticsearch_store.close()
 
     # ------------------------------------------------------------------
     # Inngest / workflow setup
@@ -338,8 +401,13 @@ class SystemContext:
         if backend == "redis":
             from unified_memory.storage.kv.redis_store import RedisKVStore
 
+            redis_url = config.get("redis_url", DEFAULT_REDIS_URL)
+            if not redis_url:
+                raise ConfigurationError(
+                    "kv_store='redis' requires a non-empty redis_url."
+                )
             return RedisKVStore(
-                url=config.get("redis_url", "redis://localhost:6379/0"),
+                url=redis_url,
             )
         return MemoryKVStore()
 
@@ -349,8 +417,13 @@ class SystemContext:
         if backend == "qdrant":
             from unified_memory.storage.vector.qdrant import QdrantVectorStore
 
+            qdrant_url = config.get("qdrant_url", DEFAULT_QDRANT_URL)
+            if not qdrant_url:
+                raise ConfigurationError(
+                    "vector_store='qdrant' requires a non-empty qdrant_url."
+                )
             return QdrantVectorStore(
-                url=config.get("qdrant_url", "http://localhost:6333"),
+                url=qdrant_url,
                 api_key=config.get("qdrant_api_key"),
             )
         return MemoryVectorStore()
@@ -361,8 +434,13 @@ class SystemContext:
         if backend == "neo4j":
             from unified_memory.storage.graph.neo4j import Neo4jGraphStore
 
+            neo4j_uri = config.get("neo4j_uri", DEFAULT_NEO4J_URI)
+            if not neo4j_uri:
+                raise ConfigurationError(
+                    "graph_store='neo4j' requires a non-empty neo4j_uri."
+                )
             return Neo4jGraphStore(
-                uri=config.get("neo4j_uri", "bolt://localhost:7687"),
+                uri=neo4j_uri,
                 auth=config.get("neo4j_auth", ("neo4j", "password")),
             )
         return NetworkXGraphStore()
@@ -373,8 +451,13 @@ class SystemContext:
             ElasticSearchStore,
         )
 
+        elasticsearch_url = config.get("elasticsearch_url", DEFAULT_ELASTICSEARCH_URL)
+        if not elasticsearch_url:
+            raise ConfigurationError(
+                "sparse_retriever='elasticsearch' requires a non-empty elasticsearch_url."
+            )
         return ElasticSearchStore(
-            url=config.get("elasticsearch_url", "http://localhost:9200"),
+            url=elasticsearch_url,
             index_name=config.get("elasticsearch_index", "unified_memory_content"),
             api_key=config.get("elasticsearch_api_key"),
         )
