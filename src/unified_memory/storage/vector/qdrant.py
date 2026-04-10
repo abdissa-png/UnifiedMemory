@@ -11,10 +11,13 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from unified_memory.core.config import DEFAULT_QDRANT_URL
+from unified_memory.core.logging import get_logger, log_event
+from unified_memory.core.resilience import external_call
 from unified_memory.storage.base import VectorStoreBackend, VectorSearchResult
 from unified_memory.core.types import RetrievalResult
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Qdrant accepts point IDs as UUID or uint64. Pipeline uses strings like "text:{content_hash}".
 # Convert non-UUID strings to a deterministic UUID so Qdrant accepts them; store original in payload.
@@ -44,7 +47,7 @@ class QdrantVectorStore(VectorStoreBackend):
     
     def __init__(
         self,
-        url: str = "http://localhost:6333",
+        url: str = DEFAULT_QDRANT_URL,
         api_key: Optional[str] = None,
         prefer_grpc: bool = False,
     ):
@@ -72,6 +75,7 @@ class QdrantVectorStore(VectorStoreBackend):
     async def disconnect(self) -> None:
         await self.client.close()
         
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def create_collection(
         self,
         name: str,
@@ -138,17 +142,19 @@ class QdrantVectorStore(VectorStoreBackend):
             )
             return True
         except Exception as e:
-            logger.error(f"Failed to create collection {name}: {e}")
+            log_event(logger, logging.ERROR, "qdrant_create_collection_failed", collection=name, error=str(e))
             return False
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def delete_collection(self, name: str) -> bool:
         try:
             safe_name = self._sanitize_collection_name(name)
             await self.client.delete_collection(safe_name)
             return True
-        except Exception:
+        except UnexpectedResponse:
             return False
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def list_collections(self, prefix: Optional[str] = None) -> List[str]:
         response = await self.client.get_collections()
         names = [c.name for c in response.collections]
@@ -156,6 +162,7 @@ class QdrantVectorStore(VectorStoreBackend):
             names = [n for n in names if n.startswith(prefix)]
         return names
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def upsert(
         self,
         vectors: List[Dict[str, Any]],
@@ -184,8 +191,16 @@ class QdrantVectorStore(VectorStoreBackend):
                 with_vectors=False
             )
             existing_map = {str(p.id): p.payload for p in existing_points}
-        except Exception:
-            # Collection might not exist yet
+        except UnexpectedResponse:
+            existing_map = {}
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "qdrant_prefetch_failed",
+                collection=collection,
+                error=str(exc),
+            )
             existing_map = {}
             
         points: List[models.PointStruct] = []
@@ -249,6 +264,7 @@ class QdrantVectorStore(VectorStoreBackend):
         )
         return len(points)
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def search(
         self,
         query_embedding: List[float],
@@ -318,6 +334,7 @@ class QdrantVectorStore(VectorStoreBackend):
             for r in results.points
         ]
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def add_namespace(
         self,
         id: str,
@@ -366,6 +383,7 @@ class QdrantVectorStore(VectorStoreBackend):
         )
         return True
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def remove_namespace(
         self,
         id: str,
@@ -420,6 +438,7 @@ class QdrantVectorStore(VectorStoreBackend):
         )
         return True, False
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def remove_document_reference(
         self,
         id: str,
@@ -469,6 +488,7 @@ class QdrantVectorStore(VectorStoreBackend):
         )
         return doc_ids
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def get_by_id(
         self,
         id: str,
@@ -505,6 +525,7 @@ class QdrantVectorStore(VectorStoreBackend):
             embedding=r.vector,
         )
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def get_by_ids(
         self,
         ids: List[str],
@@ -537,6 +558,7 @@ class QdrantVectorStore(VectorStoreBackend):
             ))
         return out
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def query_by_filter(
         self,
         filters: Dict[str, Any],
@@ -583,6 +605,7 @@ class QdrantVectorStore(VectorStoreBackend):
             for p in points
         ]
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def delete(
         self,
         ids: List[str],
@@ -633,7 +656,13 @@ class QdrantVectorStore(VectorStoreBackend):
                     points=[pid],
                 )
             except Exception as e:
-                logger.error(f"Failed to update namespaces for point {pid}: {e}")
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "qdrant_update_namespace_failed",
+                    point_id=str(pid),
+                    error=str(e),
+                )
 
         # Hard delete orphaned points
         if to_delete:
@@ -644,6 +673,7 @@ class QdrantVectorStore(VectorStoreBackend):
 
         return len(to_update) + len(to_delete)
 
+    @external_call(UnexpectedResponse, ConnectionError, TimeoutError, OSError)
     async def delete_by_filter(
         self,
         filters: Dict[str, Any],

@@ -1,4 +1,5 @@
 import uuid
+import asyncio
 
 import pytest
 
@@ -161,3 +162,44 @@ async def test_redis_kvstore_parity_scan_delete_pattern(redis_kv_store):
 
     keys = await redis_kv_store.scan(f"{prefix}user:1:*")
     assert len(keys) == 0
+
+
+@pytest.mark.asyncio
+async def test_redis_kvstore_concurrent_set_versions(redis_kv_store):
+    prefix = f"testkv:{uuid.uuid4()}:"
+    key = f"{prefix}concurrent"
+    await redis_kv_store.delete_pattern(f"{prefix}*")
+    start = asyncio.Event()
+
+    async def write(idx: int) -> None:
+        await start.wait()
+        await redis_kv_store.set(key, {"value": idx})
+
+    tasks = [asyncio.create_task(write(i)) for i in range(20)]
+    start.set()
+    await asyncio.gather(*tasks)
+
+    value = await redis_kv_store.get(key)
+    assert value is not None
+    assert value.version == 20
+
+
+@pytest.mark.asyncio
+async def test_redis_kvstore_concurrent_set_if_not_exists(redis_kv_store):
+    prefix = f"testkv:{uuid.uuid4()}:"
+    key = f"{prefix}once"
+    await redis_kv_store.delete_pattern(f"{prefix}*")
+    start = asyncio.Event()
+
+    async def create_once(idx: int) -> bool:
+        await start.wait()
+        return await redis_kv_store.set_if_not_exists(key, {"value": idx})
+
+    tasks = [asyncio.create_task(create_once(i)) for i in range(20)]
+    start.set()
+    results = await asyncio.gather(*tasks)
+
+    assert sum(1 for result in results if result) == 1
+    value = await redis_kv_store.get(key)
+    assert value is not None
+    assert value.version == 1

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, AsyncIterator, Protocol, runtime_checkable, Tuple, Union
-from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, AsyncIterator, Tuple
+from dataclasses import dataclass
 
 from unified_memory.core.types import VectorSearchResult, GraphNode, GraphEdge
 
@@ -119,6 +119,10 @@ class KVStoreBackend(ABC):
 
         raise NotImplementedError
 
+    async def close(self) -> None:
+        """Clean up backend resources."""
+        return None
+
 
 class VectorStoreBackend(ABC):
     """
@@ -143,6 +147,10 @@ class VectorStoreBackend(ABC):
         """Clean up connections. Override in implementations if needed."""
 
         return None
+
+    async def close(self) -> None:
+        """Clean up backend resources."""
+        await self.disconnect()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator["VectorStoreTransaction"]:
@@ -413,8 +421,7 @@ class VectorStoreTransaction:
 
 
 
-@runtime_checkable
-class GraphStoreBackend(Protocol):
+class GraphStoreBackend(ABC):
     """
     Graph store interface with PPR methods.
 
@@ -622,4 +629,8 @@ class GraphStoreBackend(Protocol):
 
         Returns the remaining ``source_doc_ids``.
         """
+        ...
+
+    async def close(self) -> None:
+        """Clean up backend resources."""
         ...

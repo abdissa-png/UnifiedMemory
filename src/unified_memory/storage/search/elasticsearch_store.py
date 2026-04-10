@@ -14,9 +14,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from unified_memory.core.config import DEFAULT_ELASTICSEARCH_URL
+from unified_memory.core.logging import get_logger, log_event
+from unified_memory.core.resilience import external_call
 from unified_memory.core.types import RetrievalResult
+from elasticsearch import NotFoundError
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ElasticSearchStore:
@@ -52,7 +56,7 @@ class ElasticSearchStore:
 
     def __init__(
         self,
-        url: str = "http://localhost:9200",
+        url: str = DEFAULT_ELASTICSEARCH_URL,
         index_name: str = "unified_memory_content",
         api_key: Optional[str] = None,
         basic_auth: Optional[tuple] = None,
@@ -73,6 +77,7 @@ class ElasticSearchStore:
         self._es = AsyncElasticsearch(**kwargs)
         self._index = index_name
 
+    @external_call()
     async def ensure_index(self) -> None:
         """Create the index if it does not exist."""
         exists = await self._es.indices.exists(index=self._index)
@@ -87,9 +92,11 @@ class ElasticSearchStore:
     # SparseRetriever-compatible API
     # ------------------------------------------------------------------
 
+    @external_call()
     async def add_namespace(self, content_id: str, namespace: str) -> bool:
         """Add a namespace to an existing indexed document."""
         try:
+
             await self._es.update(
                 index=self._index,
                 id=content_id,
@@ -104,7 +111,16 @@ class ElasticSearchStore:
                 },
             )
             return True
-        except Exception:
+        except NotFoundError:
+            return False
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "elasticsearch_add_namespace_failed",
+                content_id=content_id,
+                error=str(exc),
+            )
             return False
 
     async def add_namespace_batch(self, content_ids: List[str], namespace: str) -> int:
@@ -115,6 +131,7 @@ class ElasticSearchStore:
                 updated += 1
         return updated
 
+    @external_call()
     async def index(
         self,
         documents: List[Dict[str, Any]],
@@ -180,6 +197,7 @@ class ElasticSearchStore:
         )
         return success
 
+    @external_call()
     async def retrieve(
         self,
         query: str,
@@ -229,6 +247,7 @@ class ElasticSearchStore:
             )
         return results
 
+    @external_call()
     async def delete(
         self,
         doc_ids: List[str],
@@ -244,6 +263,8 @@ class ElasticSearchStore:
         affected = 0
         for content_id in doc_ids:
             try:
+                
+
                 doc = await self._es.get(index=self._index, id=content_id)
                 src = doc.get("_source", {}) or {}
 
@@ -260,10 +281,20 @@ class ElasticSearchStore:
                         body={"doc": {"namespaces": namespaces}},
                     )
                 affected += 1
-            except Exception:
+            except NotFoundError:
+                continue
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "elasticsearch_delete_failed",
+                    content_id=content_id,
+                    error=str(exc),
+                )
                 continue
         return affected
 
+    @external_call()
     async def remove_document_reference(
         self,
         doc_ids: List[str],
@@ -279,6 +310,7 @@ class ElasticSearchStore:
         remaining_map: Dict[str, List[str]] = {}
         for content_id in doc_ids:
             try:
+
                 doc = await self._es.get(index=self._index, id=content_id)
                 src = doc.get("_source", {}) or {}
 
@@ -291,7 +323,16 @@ class ElasticSearchStore:
                         body={"doc": {"source_doc_ids": source_doc_ids}},
                     )
                 remaining_map[content_id] = source_doc_ids
-            except Exception:
+            except NotFoundError:
+                continue
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "elasticsearch_remove_document_reference_failed",
+                    content_id=content_id,
+                    error=str(exc),
+                )
                 continue
         return remaining_map
 
