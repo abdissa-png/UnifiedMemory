@@ -80,14 +80,13 @@ flowchart LR
 
 ---
 
-## 4. Graph: protocol vs ABC
+## 4. Graph: entities and relationships
 
-**`GraphStoreBackend`** is a **Protocol**—implementations **need not** share a base class, which keeps Neo4j and NetworkX adapters independent.
 
 ```mermaid
 classDiagram
   class GraphStoreBackend {
-    <<Protocol>>
+    <<ABC>>
   }
   NetworkXGraphStore ..|> GraphStoreBackend
   Neo4jGraphStore ..|> GraphStoreBackend

@@ -8,7 +8,7 @@
 | **Document hash** | Tenant-scoped hash of normalized document content (`compute_document_hash`). |
 | **Extractor** | Component that runs over chunks to produce entities/relations (`ingestion/extractors`). |
 | **Fusion** | Combining ranked lists from dense/sparse/graph (`reciprocal_rank_fusion`, `linear_fusion`). |
-| **Graph store** | Backend for entities and edges, plus PPR-style operations (`GraphStoreBackend` protocol). |
+| **Graph store** | Backend for entities and edges, plus PPR-style operations. |
 | **Ingestion pipeline** | Orchestrator from raw input to indexed chunks (`IngestionPipeline`). |
 | **KV store** | Versioned key-value metadata store (`KVStoreBackend`). |
 | **Namespace** | Isolation boundary for memory; string id + `NamespaceConfig` (ACL, retrieval defaults). |

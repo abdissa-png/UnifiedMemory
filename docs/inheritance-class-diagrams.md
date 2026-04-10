@@ -16,7 +16,7 @@ classDiagram
     <<ABC>>
   }
   class GraphStoreBackend {
-    <<Protocol>>
+    <<ABC>>
   }
   KVStoreBackend <|-- MemoryKVStore
   KVStoreBackend <|-- RedisKVStore
@@ -26,28 +26,22 @@ classDiagram
   GraphStoreBackend <.. Neo4jGraphStore
 ```
 
-**Note:** `GraphStoreBackend` is a **Protocol** (`storage/base.py`), not an ABC—implementations do not need to inherit a common base class.
-
-## 2. Embeddings vs core protocols
+## 2. Embedding providers
 
 - **`embeddings/base.py`**: **`EmbeddingProvider` (ABC)** — primary implementation hierarchy for OpenAI, mock, etc.
-- **`core/interfaces.py`**: **`EmbeddingProvider` (Protocol)** — structural contract used by **`ProviderRegistry`** type hints.
-
-Implementations should satisfy **both** (the ABC satisfies the Protocol when methods match).
+- `core/interfaces.py` no longer defines a duplicate `EmbeddingProvider` protocol.
 
 ```mermaid
 flowchart LR
   ABC["EmbeddingProvider ABC\nembeddings/base.py"]
-  PROT["EmbeddingProvider Protocol\ncore/interfaces.py"]
   IMPL["OpenAIEmbeddingProvider, Mock..."]
   IMPL --> ABC
-  IMPL -.->|structurally satisfies| PROT
 ```
 
 ## 3. LLM providers
 
 - **`llm/base.py`**: **`BaseLLMProvider`** — `generate`, `generate_structured`, optional `generate_with_images`.
-- **`core/interfaces.py`**: **`LLMProvider` Protocol** — similar surface for structural typing.
+- `core/interfaces.py` no longer defines a duplicate `LLMProvider` protocol.
 
 **Implementation:** `llm/openai_provider.py` (registered in bootstrap).
 
@@ -84,9 +78,16 @@ classDiagram
 
 ## 5. Retrieval
 
-**Retriever classes** (`DenseRetriever`, `GraphRetriever`) are **orchestrators**, not a deep inheritance tree; they depend on **store protocols/backends** and **`NamespaceManager`**.
+**Retriever classes** (`DenseRetriever`, `GraphRetriever`) are **orchestrators**, not a deep inheritance tree; they depend on **store backends** and **`NamespaceManager`**.
 
 **`SparseRetriever`** is defined as a **`Protocol`** in `core/interfaces.py` and implemented by the in-process BM25 path and **`ElasticSearchStore`**.
+
+## Canonical interfaces still in `core/interfaces.py`
+
+`core/interfaces.py` now only contains protocol-only interfaces that do not have parallel ABC hierarchies:
+
+- `Reranker`
+- `SparseRetriever`
 
 ## 6. Agents
 
@@ -97,7 +98,7 @@ classDiagram
 | Goal | Extend / implement |
 | --- | --- |
 | New vector database | Subclass **`VectorStoreBackend`** |
-| New graph database | Implement **`GraphStoreBackend` protocol** |
+| New graph database | Implement **`GraphStoreBackend`** |
 | New file format | Subclass **`DocumentParser`** and register in bootstrap |
 | New chunking strategy | Subclass **`Chunker`** |
 | New entity extraction | Subclass **`Extractor`** |

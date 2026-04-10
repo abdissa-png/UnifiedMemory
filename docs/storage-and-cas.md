@@ -20,9 +20,9 @@ Namespace-aware vector upsert/search with optional **`transaction()`** context f
 
 **Implementations:** `storage/vector/memory_store.py`, `storage/vector/qdrant.py`
 
-### `GraphStoreBackend` (Protocol)
+### `GraphStoreBackend` (ABC)
 
-Structural subtyping: concrete graph backends implement the protocol methods expected by **`GraphRetriever`** and ingestion.
+Structural subtyping: concrete graph backends implement the methods expected by **`GraphRetriever`** and ingestion.
 
 **Implementations:** `storage/graph/networkx_store.py`, `storage/graph/neo4j.py`
 
@@ -52,7 +52,7 @@ Used by the **API** for:
 
 Engine creation: `storage/sql/engine.py`; ORM models: `storage/sql/models.py`.
 
-## Class / protocol diagram (storage)
+## Class diagram (storage)
 
 ```mermaid
 classDiagram
@@ -80,7 +80,7 @@ classDiagram
   VectorStoreBackend <|-- QdrantVectorStore
 
   class GraphStoreBackend {
-    <<protocol>>
+    <<abstract>>
     ...
   }
   class NetworkXGraphStore

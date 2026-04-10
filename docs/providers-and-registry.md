@@ -48,7 +48,18 @@ YAML `modality` routing:
 
 **Implementation:** `OpenAIProvider` in `llm/openai_provider.py` (wired from `_build_llm_provider`).
 
-> **Protocols:** `core/interfaces.py` also defines structural **`LLMProvider`** and **`EmbeddingProvider`** protocols used for type hints; concrete embedders subclass the ABC in `embeddings/base.py`.
+## Interface ownership
+
+The old duplicate protocols for **`EmbeddingProvider`**, **`LLMProvider`**, **`DocumentParser`**, and **`Chunker`** were removed from `core/interfaces.py`.
+
+Current source of truth:
+
+- `embeddings/base.py` → `EmbeddingProvider` (`ABC`)
+- `llm/base.py` → `BaseLLMProvider` (`ABC`)
+- `ingestion/parsers/base.py` → `DocumentParser` (`ABC`)
+- `ingestion/chunkers/base.py` → `Chunker` (`ABC`)
+
+`core/interfaces.py` now only keeps protocol-only contracts that do not have competing ABCs, primarily `Reranker` and `SparseRetriever`.
 
 ## Extractors
 
