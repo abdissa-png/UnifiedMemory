@@ -1,3 +1,4 @@
 numpy>=1.26
 typing_extensions>=4.10.0
+tenacity>=9.0.0
 

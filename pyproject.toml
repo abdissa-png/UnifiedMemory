@@ -17,7 +17,8 @@ dependencies = [
   "rank-bm25>=0.2.2",
   "json-repair==0.51.0",
   "jsonschema==4.23.0",
-  "tiktoken>=0.7.0"
+  "tiktoken>=0.7.0",
+  "tenacity>=9.0.0"
 ]
 
 [project.optional-dependencies]

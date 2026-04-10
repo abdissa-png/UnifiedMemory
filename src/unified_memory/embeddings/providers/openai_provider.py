@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional
 
+from unified_memory.core.resilience import external_call
 from unified_memory.core.types import Modality
 from unified_memory.embeddings.base import EmbeddingProvider
 
-logger = logging.getLogger(__name__)
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
@@ -61,6 +63,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def supported_modalities(self) -> List[Modality]:
         return [Modality.TEXT]
 
+    @external_call()
     async def embed(
         self,
         content: Any,
@@ -76,6 +79,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._record_usage(response.usage)
         return response.data[0].embedding
 
+    @external_call()
     async def embed_batch(
         self,
         contents: List[Any],
@@ -111,5 +115,5 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                     input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(logger, logging.DEBUG, "openai.embedding.usage.failed", error=str(exc))

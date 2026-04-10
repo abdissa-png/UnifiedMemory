@@ -22,9 +22,11 @@ import base64
 import logging
 from typing import Any, List, Optional
 
+from unified_memory.core.resilience import external_call
 from unified_memory.llm.base import BaseLLMProvider
 
-logger = logging.getLogger(__name__)
+from unified_memory.core.logging import get_logger,log_event
+logger = get_logger(__name__)
 
 
 class OpenAILLMProvider(BaseLLMProvider):
@@ -74,6 +76,7 @@ class OpenAILLMProvider(BaseLLMProvider):
     def max_tokens(self) -> int:
         return self._max_tokens
 
+    @external_call()
     async def generate(
         self,
         prompt: str,
@@ -107,6 +110,7 @@ class OpenAILLMProvider(BaseLLMProvider):
             usage_callback=usage_callback,
         )
 
+    @external_call()
     async def generate_with_images(
         self,
         prompt: str,
@@ -161,20 +165,23 @@ class OpenAILLMProvider(BaseLLMProvider):
             if usage_callback:
                 try:
                     usage_callback(i_toks, o_toks, r_toks)
-                except Exception:
-                    logger.exception("Usage callback failed")
+                except Exception as exc:
+                    log_event(logger, logging.DEBUG, "openai.completion.usage.callback.failed", error=str(exc))
 
-            record_usage(
-                UsageRecord(
-                    service="openai",
-                    model=self._model,
-                    operation="completion",
-                    input_tokens=i_toks,
-                    output_tokens=o_toks,
-                    reasoning_tokens=r_toks,
-                    cache_read_tokens=input_details.get("cache_read", 0),
-                    cache_creation_tokens=input_details.get("cache_creation", 0),
+            try:
+                record_usage(
+                    UsageRecord(
+                        service="openai",
+                        model=self._model,
+                        operation="completion",
+                        input_tokens=i_toks,
+                        output_tokens=o_toks,
+                        reasoning_tokens=r_toks,
+                        cache_read_tokens=input_details.get("cache_read", 0),
+                        cache_creation_tokens=input_details.get("cache_creation", 0),
+                    )
                 )
-            )
-        except Exception:
-            pass
+            except Exception as exc:
+                log_event(logger, logging.DEBUG, "openai.completion.usage.failed", error=str(exc))
+        except Exception as exc:
+            log_event(logger, logging.DEBUG, "openai.completion.usage.failed", error=str(exc))
