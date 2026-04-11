@@ -32,8 +32,11 @@ async def lifespan(app: FastAPI):
     config_path = os.environ.get("UMS_CONFIG", "config/app.example.yaml")
     jwt_secret = os.environ.get("UMS_JWT_SECRET", "change-me-in-production")
     token_expire_minutes = int(os.environ.get("UMS_TOKEN_EXPIRE_MINUTES", "60"))
-    db_url = os.environ.get("UMS_DATABASE_URL", "sqlite+aiosqlite:///./memory_system.db")
+    db_url = os.environ.get("UMS_DATABASE_URL","postgresql+asyncpg://postgres:postgres@localhost:5432/unified_memory_test")
     enable_inngest = os.environ.get("UMS_ENABLE_INNGEST", "").lower() in ("1", "true")
+    allow_create_all_fallback = os.environ.get(
+        "UMS_SQL_CREATE_ALL_FALLBACK", ""
+    ).lower() in ("1", "true")
 
     # Build system context
     if os.path.exists(config_path):
@@ -46,10 +49,18 @@ async def lifespan(app: FastAPI):
     # SQL engine
     sql_engine = create_sql_engine(db_url)
     sf = create_session_factory(sql_engine)
-    await init_db(sql_engine)
+    await init_db(
+        sql_engine,
+        db_url,
+        allow_create_all_fallback=allow_create_all_fallback,
+    )
 
     ctx.sql_session_factory = sf
     ctx.chat_session_manager = ChatSessionManager(sf)
+    if ctx.ingestion_pipeline is not None:
+        ctx.ingestion_pipeline.chat_session_manager = ctx.chat_session_manager
+    if ctx.qa_agent is not None:
+        ctx.qa_agent.session_manager = ctx.chat_session_manager
     ctx.audit_logger = AuditLogger(sf)
     ctx.tenant_manager = TenantManager(ctx.kv_store)
 

@@ -6,6 +6,20 @@
 #   docker compose -f docker-compose.test.yml down -v
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: unified_memory_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d unified_memory_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   redis:
     image: redis:7-alpine
     # Ephemeral: no RDB/AOF — avoids fork-based saves that trigger the

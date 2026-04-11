@@ -59,10 +59,12 @@ all = [
 ]
 server = [
   "unified-memory-system[all,workflows]",
+  "alembic>=1.13.0",
   "fastapi>=0.100.0",
   "uvicorn>=0.20.0",
   "sqlalchemy[asyncio]>=2.0.0",
   "aiosqlite>=0.19.0",
+  "asyncpg>=0.29.0",
   "pyyaml>=6.0",
   "python-jose[cryptography]>=3.3.0",
   "passlib[bcrypt]>=1.7.4",

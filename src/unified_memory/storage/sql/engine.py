@@ -4,13 +4,15 @@ SQLAlchemy async engine and session factory helpers.
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Optional
 
 from .models import Base
 
 
 def create_sql_engine(
-    database_url: str = "sqlite+aiosqlite:///./memory_system.db",
+    database_url: str,
     echo: bool = False,
 ):
     """Create an async SQLAlchemy engine."""
@@ -25,13 +27,54 @@ def create_session_factory(engine):
 
     return async_sessionmaker(engine, expire_on_commit=False)
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
 
-async def init_db(engine) -> None:
-    """Create all tables (for development / first-run bootstrap).
-    
-    WARNING: For this to work correctly, all SQLAlchemy models must be defined 
-    in (or imported by) `storage.sql.models` before this function is called.
-    `Base.metadata.create_all` only creates tables for models it knows about.
-    """
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+
+def _alembic_ini_path() -> Path:
+    return _repo_root() / "alembic.ini"
+
+
+def _create_all_sync(engine) -> None:
+    import asyncio as _asyncio
+
+    async def _create_all() -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    _asyncio.run(_create_all())
+
+
+def _run_alembic_upgrade(database_url: str) -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(_alembic_ini_path()))
+    cfg.set_main_option("script_location", str(_repo_root() / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(cfg, "head")
+
+
+async def init_db(
+    engine,
+    database_url: str,
+    *,
+    allow_create_all_fallback: bool = False,
+) -> None:
+    """Apply Alembic migrations, optionally falling back to ``create_all``."""
+    alembic_ini = _alembic_ini_path()
+    if alembic_ini.exists():
+        try:
+            await asyncio.to_thread(_run_alembic_upgrade, database_url)
+            return
+        except Exception:
+            if not allow_create_all_fallback:
+                raise
+
+    if not allow_create_all_fallback:
+        raise RuntimeError(
+            "Alembic migrations are required. Set "
+            "UMS_SQL_CREATE_ALL_FALLBACK=true only for local/dev fallback."
+        )
+
+    await asyncio.to_thread(_create_all_sync, engine)

@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select, delete as sa_delete
 
 from .models import ChatSession, ChatMessage, SessionDocument
+from unified_memory.core.utils import utc_now
 
 
 def _estimate_tokens(text: str) -> int:
@@ -101,6 +102,12 @@ class ChatSessionManager:
                 session = await db.get(ChatSession, session_id)
                 if session and not session.title:
                     session.title = content[:100].strip()
+                if session:
+                    session.updated_at = utc_now()
+            else:
+                session = await db.get(ChatSession, session_id)
+                if session:
+                    session.updated_at = utc_now()
 
             await db.commit()
             await db.refresh(msg)
@@ -127,6 +134,9 @@ class ChatSessionManager:
             if existing:
                 return
             db.add(SessionDocument(session_id=session_id, document_id=document_id))
+            session = await db.get(ChatSession, session_id)
+            if session:
+                session.updated_at = utc_now()
             await db.commit()
 
     async def get_associated_documents(self, session_id: str) -> List[str]:

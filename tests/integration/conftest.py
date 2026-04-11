@@ -12,6 +12,10 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_AUTH = ("neo4j", "password")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
+DATABASE_URL = os.getenv(
+    "UMS_DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/unified_memory_test",
+)
 
 @pytest_asyncio.fixture(scope="function")
 async def real_vector_store():

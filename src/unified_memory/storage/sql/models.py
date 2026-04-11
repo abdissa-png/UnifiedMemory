@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    MetaData,
     String,
     Text,
 )
@@ -19,8 +20,19 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql import func
 
 
+metadata = MetaData(
+    naming_convention={
+        "ix": "ix_%(table_name)s_%(column_0_name)s",
+        "uq": "uq_%(table_name)s_%(column_0_name)s",
+        "ck": "ck_%(table_name)s_%(constraint_name)s",
+        "fk": "fk_%(table_name)s_%(column_0_name)s",
+        "pk": "pk_%(table_name)s",
+    }
+)
+
+
 class Base(DeclarativeBase):
-    pass
+    metadata = metadata
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +45,7 @@ class User(Base):
 
     id = Column(String(64), primary_key=True)
     tenant_id = Column(String(64), nullable=False, index=True)
-    email = Column(String(255), unique=True, nullable=False)
+    email = Column(String(255), nullable=False)
     display_name = Column(String(255), default="")
     password_hash = Column(String(255), nullable=False)
     roles_json = Column(Text, default="[]")
@@ -55,9 +67,11 @@ class ChatSession(Base):
     namespace = Column(String(512), nullable=False)
     title = Column(String(255), default="")
     agent_config_json = Column(Text, default="{}")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     updated_at = Column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     messages = relationship(
@@ -104,6 +118,9 @@ class SessionDocument(Base):
     document_id = Column(String(128), primary_key=True)
     added_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    __table_args__ = (
+        Index("ix_session_document_session_id", "session_id"),
+    )
 
 # ---------------------------------------------------------------------------
 # Audit
