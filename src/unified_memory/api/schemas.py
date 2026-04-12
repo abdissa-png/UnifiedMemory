@@ -86,13 +86,30 @@ class IngestTextRequest(BaseModel):
     text: str
     title: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
-    document_id: str
+    document_id: Optional[str] = None
     chunk_count: int = 0
     doc_hash: str = ""
+    job_id: Optional[str] = None
     status: str = "ingested"
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    operation: str
+    tenant_id: str
+    namespace: str
+    status: str
+    stage: str
+    document_id: str = ""
+    doc_hash: str = ""
+    error: Optional[str] = None
+    result: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
 
 
 class DocumentResponse(BaseModel):

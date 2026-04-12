@@ -19,9 +19,13 @@ class IngestEventData:
     tenant_id: str
     namespace: str
     document_id: str
+    job_id: str = ""
     source_path: Optional[str] = None
     source_text: Optional[str] = None
     title: Optional[str] = None
+    original_filename: Optional[str] = None
+    content_type: Optional[str] = None
+    session_id: Optional[str] = None
     options: Optional[dict] = None
 
 
@@ -32,3 +36,4 @@ class DeleteEventData:
     tenant_id: str
     namespace: str
     doc_hash: str
+    job_id: str
