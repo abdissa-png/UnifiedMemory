@@ -342,7 +342,8 @@ class RetrievalConfig:
     score_threshold: Optional[float] = None
     # Optional per-request fusion weights (used when fusion_method == "linear")
     fusion_weights: Optional[Dict[str, float]] = None
-    
+    reranker_key: Optional[str] = "bge-local"
+
     @classmethod
     async def resolve(
         cls,
@@ -376,4 +377,5 @@ class RetrievalConfig:
             paths=request.get("paths", ["dense", "sparse", "graph"]),
             score_threshold=request.get("score_threshold"),
             fusion_weights=request.get("fusion_weights"),
+            reranker_key=request.get("reranker_key", "bge-local"),
         )

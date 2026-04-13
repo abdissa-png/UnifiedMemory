@@ -137,6 +137,7 @@ class SearchRequest(BaseModel):
     fusion_weights: Optional[Dict[str, float]] = None
     score_threshold: Optional[float] = None
     rerank_candidates_limit: int = 50
+    reranker_key: Optional[str] = "bge-local"
     target_namespaces: Optional[List[str]] = None  # cross-namespace search
 
 

@@ -42,6 +42,7 @@ async def search(
             "fusion_weights": body.fusion_weights,
             "score_threshold": body.score_threshold,
             "rerank_candidates_limit": body.rerank_candidates_limit,
+            "reranker_key": body.reranker_key,
         },
         target_namespaces=body.target_namespaces,
         filters=body.filters,
