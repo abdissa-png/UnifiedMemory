@@ -34,6 +34,7 @@ from unified_memory.namespace.types import (
 from unified_memory.namespace.tenant_manager import TenantManager
 from unified_memory.workflows.artifact_store import InMemoryArtifactStore
 from unified_memory.cas.image_content_store import InMemoryImageContentStore
+from unified_memory.cas.document_content_store import InMemoryDocumentContentStore
 
 
 @pytest.fixture
@@ -74,13 +75,19 @@ def image_content_store():
 
 
 @pytest.fixture
-def pipeline(deps, artifact_store, image_content_store):
+def document_content_store():
+    return InMemoryDocumentContentStore()
+
+
+@pytest.fixture
+def pipeline(deps, artifact_store, image_content_store, document_content_store):
     d = {k: v for k, v in deps.items() if k != "kv"}
     return IngestionPipeline(
         **d,
         chunker=FixedSizeChunker(),
         artifact_store=artifact_store,
         image_content_store=image_content_store,
+        document_content_store=document_content_store,
     )
 
 
@@ -348,6 +355,18 @@ async def test_shared_chunk_deletion_across_namespaces(deps, kv, namespace_manag
         f"had {initial_count}, now {final_count}"
     )
 
+    reg_entry = await deps["document_registry"].get_document(tenant_id, doc_hash)
+    assert reg_entry is not None
+    text_collection = await namespace_manager.get_collection_name(ns2, CollectionType.TEXTS)
+    vec = await vec_store.get_by_id(
+        reg_entry.text_vector_ids[0],
+        collection=text_collection,
+        namespace=ns2,
+    )
+    assert vec is not None
+    assert res1.document_id in (vec.metadata.get("source_doc_ids") or [])
+    assert vec.metadata.get("source_locations"), "shared delete must preserve provenance"
+
 
 @pytest.mark.asyncio
 async def test_shared_vector_two_docs_same_namespace(deps, kv, namespace_manager):
@@ -452,3 +471,79 @@ async def test_image_content_store_round_trip(image_content_store):
     deleted = await image_content_store.delete_image(img_hash)
     assert deleted is True
     assert await image_content_store.get_image(img_hash) is None
+
+
+@pytest.mark.asyncio
+async def test_ingest_file_finalizes_document_store_and_session_link(
+    pipeline,
+    kv,
+    namespace_manager,
+    tenant_id,
+    ns_id,
+    tmp_path,
+):
+    await _setup_namespace(kv, namespace_manager, tenant_id, ns_id)
+    pipeline.chat_session_manager = AsyncMock()
+
+    path = tmp_path / "report.txt"
+    path.write_text("A test document that should be stored canonically.")
+
+    result = await pipeline.ingest_file(
+        path=path,
+        namespace=ns_id,
+        session_id="session-123",
+        original_filename="report.txt",
+        content_type="text/plain",
+    )
+
+    stored = await pipeline.document_content_store.get_document(
+        tenant_id, result.doc_hash
+    )
+    meta = await pipeline.document_content_store.get_document_metadata(
+        tenant_id, result.doc_hash
+    )
+
+    assert result.success
+    assert stored == path.read_bytes()
+    assert meta is not None
+    assert meta.original_filename == "report.txt"
+    pipeline.chat_session_manager.associate_document.assert_awaited_once_with(
+        "session-123", result.document_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_document_removes_original_after_last_namespace(
+    pipeline,
+    kv,
+    namespace_manager,
+    tenant_id,
+    ns_id,
+    tmp_path,
+):
+    await _setup_namespace(kv, namespace_manager, tenant_id, ns_id)
+
+    path = tmp_path / "delete-me.txt"
+    path.write_text("Stored bytes must be removed after the final delete.")
+
+    result = await pipeline.ingest_file(
+        path=path,
+        namespace=ns_id,
+        original_filename="delete-me.txt",
+        content_type="text/plain",
+    )
+
+    assert await pipeline.document_content_store.document_exists(
+        tenant_id, result.doc_hash
+    )
+
+    delete_result = await pipeline.delete_document(
+        tenant_id=tenant_id,
+        document_hash=result.doc_hash,
+        namespace=ns_id,
+    )
+
+    assert delete_result.found is True
+    assert not await pipeline.document_content_store.document_exists(
+        tenant_id, result.doc_hash
+    )

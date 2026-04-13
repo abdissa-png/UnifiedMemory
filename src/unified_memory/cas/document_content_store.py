@@ -76,6 +76,7 @@ class DocumentContentStore(ABC):
         data: bytes,
         original_filename: str = "",
         content_type: str = "application/octet-stream",
+        size_bytes: Optional[int] = None,
     ) -> DocumentStorageMetadata:
         """Store original document bytes.  Idempotent — no-op if already stored."""
 
@@ -135,6 +136,7 @@ class LocalFSDocumentContentStore(DocumentContentStore):
         data: bytes,
         original_filename: str = "",
         content_type: str = "application/octet-stream",
+        size_bytes: Optional[int] = None,
     ) -> DocumentStorageMetadata:
         data_path = self._data_path(tenant_id, doc_hash)
         meta_path = self._meta_path(tenant_id, doc_hash)
@@ -144,7 +146,7 @@ class LocalFSDocumentContentStore(DocumentContentStore):
             doc_hash=doc_hash,
             original_filename=original_filename,
             content_type=content_type,
-            size_bytes=len(data),
+            size_bytes=size_bytes if size_bytes is not None else len(data),
         )
 
         # Idempotent: skip if already stored
@@ -216,6 +218,7 @@ class InMemoryDocumentContentStore(DocumentContentStore):
         data: bytes,
         original_filename: str = "",
         content_type: str = "application/octet-stream",
+        size_bytes: Optional[int] = None,
     ) -> DocumentStorageMetadata:
         key = self._key(tenant_id, doc_hash)
         meta = DocumentStorageMetadata(
@@ -223,7 +226,7 @@ class InMemoryDocumentContentStore(DocumentContentStore):
             doc_hash=doc_hash,
             original_filename=original_filename,
             content_type=content_type,
-            size_bytes=len(data),
+            size_bytes=size_bytes if size_bytes is not None else len(data),
         )
         if key not in self._documents:
             self._documents[key] = data

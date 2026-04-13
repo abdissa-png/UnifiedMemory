@@ -19,10 +19,17 @@ from unified_memory.api.schemas import (
     DocumentResponse,
     IngestResponse,
     IngestTextRequest,
+    JobStatusResponse,
 )
 from unified_memory.auth.jwt_handler import AuthenticatedUser
 from unified_memory.core.types import Permission
 from unified_memory.observability.tracing import set_request_context
+from unified_memory.workflows.job_state import (
+    IngestionJobState,
+    JobStage,
+    load_job_state,
+    save_job_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,16 @@ async def ingest_text(
     inngest_client = getattr(ctx, "inngest_client", None)
     if background and inngest_client:
         job_id = uuid.uuid4().hex
+        document_id = uuid.uuid4().hex
+        job_state = IngestionJobState(
+            job_id=job_id,
+            tenant_id=user.tenant_id,
+            namespace=namespace,
+            operation="ingest",
+            document_id=document_id,
+            stage=JobStage.DISPATCHED,
+        )
+        await save_job_state(ctx.kv_store, job_state)
         try:
             import inngest
             await inngest_client.send(
@@ -57,10 +74,11 @@ async def ingest_text(
                     data={
                         "tenant_id": user.tenant_id,
                         "namespace": namespace,
-                        "document_id": uuid.uuid4().hex,
+                        "document_id": document_id,
                         "source_text": body.text,
                         "title": body.title,
                         "job_id": job_id,
+                        "session_id": body.session_id,
                         "options": {"metadata": body.metadata} if body.metadata else {},
                     },
                 )
@@ -71,6 +89,7 @@ async def ingest_text(
                 status="processing",
             )
         except Exception:
+            await ctx.kv_store.delete(IngestionJobState.kv_key(job_id))
             logger.exception("Inngest dispatch failed, falling back to sync")
 
     # ---- sync path ----
@@ -80,6 +99,7 @@ async def ingest_text(
         namespace=namespace,
         title=body.title,
         metadata=body.metadata,
+        session_id=body.session_id,
     )
     if not result.success:
         raise HTTPException(422, "; ".join(result.errors))
@@ -113,6 +133,7 @@ async def ingest_file(
     namespace: str = Form(...),
     file: UploadFile = File(...),
     title: str = Form(None),
+    session_id: str = Form(None),
     background: bool = Form(True),
     user: AuthenticatedUser = Depends(get_current_user),
     ns_config=Depends(ACLChecker(Permission.WRITE)),
@@ -126,29 +147,21 @@ async def ingest_file(
     content_type = file.content_type or "application/octet-stream"
     suffix = os.path.splitext(filename)[1]
 
-    # Store document permanently BEFORE dispatching to Inngest
-    doc_store = getattr(ctx, "document_content_store", None)
-
     # ---- async Inngest path ----
     inngest_client = getattr(ctx, "inngest_client", None)
     if background and inngest_client:
         job_id = uuid.uuid4().hex
         document_id = uuid.uuid4().hex
-        # Persist the raw file first so the workflow can retrieve it
+        job_state = IngestionJobState(
+            job_id=job_id,
+            tenant_id=user.tenant_id,
+            namespace=namespace,
+            operation="ingest",
+            document_id=document_id,
+            stage=JobStage.DISPATCHED,
+        )
+        await save_job_state(ctx.kv_store, job_state)
         tmp_permanent = None
-        if doc_store:
-            # Store raw bytes under a temp hash; the workflow will re-hash after parsing
-            from unified_memory.core.types import compute_document_hash
-            import hashlib
-            raw_hash = hashlib.sha256(contents).hexdigest()
-            await doc_store.store_document(
-                tenant_id=user.tenant_id,
-                doc_hash=raw_hash,
-                data=contents,
-                original_filename=filename,
-                content_type=content_type,
-                size_bytes=len(contents),
-            )
         # Write temp file for the workflow to read
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(contents)
@@ -166,6 +179,9 @@ async def ingest_file(
                         "source_path": tmp_permanent,
                         "title": title or filename,
                         "job_id": job_id,
+                        "original_filename": filename,
+                        "content_type": content_type,
+                        "session_id": session_id,
                     },
                 )
             )
@@ -175,6 +191,7 @@ async def ingest_file(
                 status="processing",
             )
         except Exception:
+            await ctx.kv_store.delete(IngestionJobState.kv_key(job_id))
             logger.exception("Inngest dispatch failed, falling back to sync")
             if tmp_permanent:
                 os.unlink(tmp_permanent)
@@ -191,6 +208,9 @@ async def ingest_file(
             path=Path(tmp_path),
             namespace=namespace,
             title=title,
+            session_id=session_id,
+            original_filename=filename,
+            content_type=content_type,
         )
     finally:
         os.unlink(tmp_path)
@@ -198,20 +218,6 @@ async def ingest_file(
     if not result.success:
         raise HTTPException(422, "; ".join(result.errors))
 
-    # Store original document permanently using the pipeline's canonical
-    # doc_hash (derived from parsed text + tenant_id).  This is idempotent
-    # so duplicated uploads are a no-op.
-    doc_store = getattr(ctx, "document_content_store", None)
-    if doc_store and result.doc_hash:
-        await doc_store.store_document(
-            tenant_id=user.tenant_id,
-            doc_hash=result.doc_hash,
-            data=contents,
-            original_filename=filename,
-            content_type=content_type,
-            size_bytes=len(contents),
-        )
-        
     if getattr(ctx, "audit_logger", None):
         await ctx.audit_logger.log(
             tenant_id=user.tenant_id,
@@ -333,6 +339,18 @@ async def delete_document(
     # ---- async Inngest path ----
     inngest_client = getattr(ctx, "inngest_client", None)
     if background and inngest_client:
+        job_id = uuid.uuid4().hex
+        await save_job_state(
+            ctx.kv_store,
+            IngestionJobState(
+                job_id=job_id,
+                tenant_id=user.tenant_id,
+                namespace=namespace,
+                operation="delete",
+                doc_hash=doc_hash,
+                stage=JobStage.DISPATCHED,
+            ),
+        )
         try:
             import inngest
             await inngest_client.send(
@@ -342,6 +360,7 @@ async def delete_document(
                         "tenant_id": user.tenant_id,
                         "namespace": namespace,
                         "doc_hash": doc_hash,
+                        "job_id": job_id,
                     },
                 )
             )
@@ -361,29 +380,20 @@ async def delete_document(
             return {
                 "status": "delete_processing",
                 "doc_hash": doc_hash,
+                "job_id": job_id,
             }
         except Exception:
+            await ctx.kv_store.delete(IngestionJobState.kv_key(job_id))
             logger.exception("Inngest delete dispatch failed, falling back to sync")
 
     # ---- sync path ----
     result = await ctx.ingestion_pipeline.delete_document(
+        tenant_id=user.tenant_id,
+        document_hash=doc_hash,
         namespace=namespace,
-        doc_hash=doc_hash,
     )
     if not result.found:
         raise HTTPException(404, "Document not found")
-
-    # Update namespace-docs index
-    await ctx.document_registry.remove_doc_from_namespace_index(
-        namespace, doc_hash
-    )
-
-    # If the document has no remaining namespaces, clean up the permanent store
-    reg_entry = await ctx.document_registry.get_document(user.tenant_id, doc_hash)
-    if not reg_entry or not reg_entry.namespaces:
-        doc_store = getattr(ctx, "document_content_store", None)
-        if doc_store:
-            await doc_store.delete_document(user.tenant_id, doc_hash)
             
     if getattr(ctx, "audit_logger", None):
         await ctx.audit_logger.log(
@@ -401,3 +411,31 @@ async def delete_document(
         "vectors_deleted": result.vectors_deleted,
         "nodes_deleted": result.nodes_deleted,
     }
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(
+    job_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    ctx=Depends(get_system_context),
+):
+    job = await load_job_state(ctx.kv_store, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.tenant_id != user.tenant_id:
+        raise HTTPException(403, "Cross-tenant access denied")
+
+    return JobStatusResponse(
+        job_id=job.job_id,
+        operation=job.operation,
+        tenant_id=job.tenant_id,
+        namespace=job.namespace,
+        status=job.status.value,
+        stage=job.stage.value,
+        document_id=job.document_id,
+        doc_hash=job.doc_hash,
+        error=job.error,
+        result=job.result,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )

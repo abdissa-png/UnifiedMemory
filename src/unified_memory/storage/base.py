@@ -631,6 +631,14 @@ class GraphStoreBackend(ABC):
         """
         ...
 
+    async def get_document_references(
+        self,
+        id: str,
+        namespace: str,
+    ) -> List[str]:
+        """Return current ``source_doc_ids`` for a node or edge."""
+        ...
+
     async def close(self) -> None:
         """Clean up backend resources."""
         ...

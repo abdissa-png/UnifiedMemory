@@ -163,6 +163,101 @@ class IngestionPipeline:
         self._artifact_store = artifact_store
         self.image_content_store = image_content_store
         self.document_content_store = document_content_store
+        self.chat_session_manager: Optional[Any] = None
+
+    async def _get_runtime_tenant_config(
+        self,
+        tenant_id: str,
+        ctx: Optional[dict] = None,
+    ) -> TenantConfig:
+        """Fetch the latest tenant config, falling back to a serialized snapshot."""
+        tenant_config = await self.namespace_manager.get_tenant_config(tenant_id)
+        if tenant_config is not None:
+            return tenant_config
+
+        tc_dict = (ctx or {}).get("tenant_config", {})
+        if tc_dict:
+            tenant_config = TenantConfig(
+                **{
+                    k: v
+                    for k, v in tc_dict.items()
+                    if k in TenantConfig.__dataclass_fields__
+                }
+            )
+            return tenant_config
+
+        raise TenantConfigNotFoundError(
+            f"Tenant config not found for tenant {tenant_id}"
+        )
+
+    async def finalize_ingest_lifecycle(
+        self,
+        *,
+        tenant_id: str,
+        namespace: str,
+        document_id: str,
+        doc_hash: str,
+        session_id: Optional[str] = None,
+        original_bytes: Optional[bytes] = None,
+        source_path: Optional[str | Path] = None,
+        original_filename: str = "",
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        """Run shared ingest finalization for sync and async flows."""
+        await self.document_registry.add_doc_to_namespace_index(
+            namespace, doc_hash, document_id
+        )
+
+        if original_bytes is None and source_path:
+            path_obj = Path(source_path)
+            if path_obj.exists():
+                original_bytes = path_obj.read_bytes()
+
+        if (
+            self.document_content_store
+            and doc_hash
+            and original_bytes is not None
+        ):
+            await self.document_content_store.store_document(
+                tenant_id=tenant_id,
+                doc_hash=doc_hash,
+                data=original_bytes,
+                original_filename=original_filename,
+                content_type=content_type,
+                size_bytes=len(original_bytes),
+            )
+
+        if session_id and self.chat_session_manager:
+            await self.chat_session_manager.associate_document(
+                session_id, document_id
+            )
+
+    async def finalize_delete_lifecycle(
+        self,
+        *,
+        tenant_id: str,
+        namespace: str,
+        doc_hash: str,
+    ) -> dict:
+        """Run shared delete finalization for sync and async flows."""
+        await self.document_registry.remove_doc_from_namespace_index(
+            namespace, doc_hash
+        )
+
+        reg_entry = await self.document_registry.get_document(tenant_id, doc_hash)
+        original_deleted = False
+        if (
+            (not reg_entry or not reg_entry.namespaces)
+            and self.document_content_store is not None
+        ):
+            original_deleted = await self.document_content_store.delete_document(
+                tenant_id, doc_hash
+            )
+
+        return {
+            "namespace_index_removed": True,
+            "original_deleted": original_deleted,
+        }
 
     @property
     def embedding_provider(self) -> EmbeddingProvider:
@@ -653,13 +748,7 @@ class IngestionPipeline:
         doc_dict = await artifact_store.get_json(parsed_artifact_uri)
         parsed = parsed_doc_from_dict(doc_dict)
 
-        tc_dict = ctx.get("tenant_config", {})
-        tenant_config = TenantConfig(**{
-            k: v for k, v in tc_dict.items()
-            if k in TenantConfig.__dataclass_fields__
-        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
-        if tenant_config is None:
-            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
+        tenant_config = await self._get_runtime_tenant_config(tenant_id, ctx)
         req_chunker, chunk_cfg = self._build_chunker_for_tenant(tenant_config)
         chunks = await req_chunker.chunk(
             parsed, namespace, tenant_id=tenant_id, config=chunk_cfg
@@ -711,14 +800,12 @@ class IngestionPipeline:
         """
         from unified_memory.core.types import compute_vector_id
 
-        embedding_model = ctx["text_embedding_model"]
-        tc_dict = ctx.get("tenant_config", {})
-        tenant_config = TenantConfig(**{
-            k: v for k, v in tc_dict.items()
-            if k in TenantConfig.__dataclass_fields__
-        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
-        if tenant_config is None:
-            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
+        tenant_config = await self._get_runtime_tenant_config(tenant_id, ctx)
+        embedding_model = (
+            tenant_config.text_embedding.model
+            if tenant_config and tenant_config.text_embedding
+            else ctx.get("text_embedding_model", "default")
+        )
         embedder = self._resolve_embedder_from_tenant(tenant_config)
 
         text_collection = await self.namespace_manager.get_collection_name(
@@ -916,7 +1003,13 @@ class IngestionPipeline:
 
         doc_dict = await artifact_store.get_json(parsed_artifact_uri)
         parsed = parsed_doc_from_dict(doc_dict) if doc_dict else None
-        snippet_len = ctx.get("page_snippet_length", 200)
+        tenant_config = await self._get_runtime_tenant_config(tenant_id, ctx)
+        snippet_len = (
+            tenant_config.page_snippet_length
+            if hasattr(tenant_config, "page_snippet_length")
+            and tenant_config.page_snippet_length is not None
+            else ctx.get("page_snippet_length", 200)
+        )
 
         if parsed:
             for page in parsed.pages:
@@ -931,16 +1024,17 @@ class IngestionPipeline:
                 nodes_to_create.append(page_node)
                 graph_node_ids.append(page_node.id)
 
-        extraction_config_dict = ctx.get("extraction_config")
-        extraction_config: Optional[ExtractionConfig] = None
-        if extraction_config_dict:
+        raw_extraction = tenant_config.extraction
+        if isinstance(raw_extraction, dict):
             extraction_config = ExtractionConfig(
                 **{
                     k: v
-                    for k, v in extraction_config_dict.items()
+                    for k, v in raw_extraction.items()
                     if k in ExtractionConfig.__dataclass_fields__
                 }
-            )
+            ) if raw_extraction else None
+        else:
+            extraction_config = raw_extraction
         extractor = self._resolve_extractor_from_config(extraction_config)
 
         for idx, content_hash in enumerate(chunk_content_hashes):
@@ -1229,13 +1323,7 @@ class IngestionPipeline:
         relation_vector_ids: List[str] = []
 
         ctx = ctx or {}
-        tc_dict = ctx.get("tenant_config", {})
-        tenant_config = TenantConfig(**{
-            k: v for k, v in tc_dict.items()
-            if k in TenantConfig.__dataclass_fields__
-        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
-        if tenant_config is None:
-            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
+        tenant_config = await self._get_runtime_tenant_config(tenant_id, ctx)
         embedder = self._resolve_embedder_from_tenant(tenant_config)
 
         if entity_descriptors:
@@ -1404,15 +1492,12 @@ class IngestionPipeline:
         if not ctx.get("enable_visual") or not page_image_uris:
             return {"page_image_vector_ids": [], "errors": []}
 
-        vision_model = ctx.get("vision_embedding_model", "")
-
-        tc_dict = ctx.get("tenant_config", {})
-        tenant_config = TenantConfig(**{
-            k: v for k, v in tc_dict.items()
-            if k in TenantConfig.__dataclass_fields__
-        }) if tc_dict else await self.namespace_manager.get_tenant_config(tenant_id)
-        if tenant_config is None:
-            raise TenantConfigNotFoundError(f"Tenant config not found for tenant {tenant_id}")
+        tenant_config = await self._get_runtime_tenant_config(tenant_id, ctx)
+        vision_model = (
+            tenant_config.vision_embedding.model
+            if tenant_config and tenant_config.vision_embedding
+            else ctx.get("vision_embedding_model", "")
+        )
         vision_embedder = self._resolve_vision_embedder_from_tenant(
             tenant_config
         )
@@ -2179,10 +2264,13 @@ class IngestionPipeline:
         path: Path,
         namespace: str = "default",
         document_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         skip_embedding: bool = False,
         **options: Any,
     ) -> IngestionResult:
         doc_id = document_id or str(uuid.uuid4())
+        original_filename = options.get("original_filename") or path.name
+        content_type = options.get("content_type") or "application/octet-stream"
         # Initial source_ref for error paths; will be replaced with parser-provided
         # source once parsing succeeds.
         source_ref = SourceReference(source_id=doc_id, source_type=SourceType.TEXT_BLOCK)
@@ -2235,7 +2323,7 @@ class IngestionPipeline:
                         doc_hash,
                         namespace,
                     )
-                    return IngestionResult(
+                    result = IngestionResult(
                         document_id=existing_doc.document_id,
                         source=source_ref,
                         chunk_count=len(existing_doc.chunk_content_hashes),
@@ -2252,6 +2340,17 @@ class IngestionPipeline:
                         deduped=True,
                         doc_hash=doc_hash,
                     )
+                    await self.finalize_ingest_lifecycle(
+                        tenant_id=ns_config.tenant_id,
+                        namespace=namespace,
+                        document_id=result.document_id,
+                        doc_hash=doc_hash,
+                        session_id=session_id,
+                        source_path=path,
+                        original_filename=original_filename,
+                        content_type=content_type,
+                    )
+                    return result
 
                 # PATH B: Fast link
                 logger.info(f"Document {doc_hash} already exists. Path B (Fast Link) for {namespace}")
@@ -2314,12 +2413,7 @@ class IngestionPipeline:
                     for i, content_hash in enumerate(existing_doc.chunk_content_hashes)
                 ]
                 
-                # Update namespace-docs index
-                await self.document_registry.add_doc_to_namespace_index(
-                    namespace, doc_hash, existing_doc.document_id
-                )
-
-                return IngestionResult(
+                result = IngestionResult(
                     document_id=existing_doc.document_id,
                     source=source_ref,
                     chunk_count=len(chunks_for_result),
@@ -2328,6 +2422,17 @@ class IngestionPipeline:
                     deduped=True,
                     doc_hash=doc_hash,
                 )
+                await self.finalize_ingest_lifecycle(
+                    tenant_id=ns_config.tenant_id,
+                    namespace=namespace,
+                    document_id=result.document_id,
+                    doc_hash=doc_hash,
+                    session_id=session_id,
+                    source_path=path,
+                    original_filename=original_filename,
+                    content_type=content_type,
+                )
+                return result
             
             # PATH A: Full Ingestion
             # Register new doc
@@ -2375,12 +2480,7 @@ class IngestionPipeline:
                 chunk_content_hashes=chunk_hashes,
             )
 
-            # Update namespace-docs index
-            await self.document_registry.add_doc_to_namespace_index(
-                namespace, doc_hash, doc_id
-            )
-
-            return IngestionResult(
+            result = IngestionResult(
                 document_id=doc_id,
                 source=source_ref,
                 chunk_count=len(chunks),
@@ -2390,6 +2490,17 @@ class IngestionPipeline:
                 deduped=False,
                 doc_hash=doc_hash,
             )
+            await self.finalize_ingest_lifecycle(
+                tenant_id=ns_config.tenant_id,
+                namespace=namespace,
+                document_id=result.document_id,
+                doc_hash=doc_hash,
+                session_id=session_id,
+                source_path=path,
+                original_filename=original_filename,
+                content_type=content_type,
+            )
+            return result
         except Exception as e:
             logger.exception(f"Error ingesting file: {path}")
             return IngestionResult(doc_id, source_ref, errors=[str(e)])
@@ -2402,6 +2513,7 @@ class IngestionPipeline:
         document_id: Optional[str] = None,
         title: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
         skip_embedding: bool = False,
     ) -> IngestionResult:
         import uuid
@@ -2454,7 +2566,7 @@ class IngestionPipeline:
                         )
                         for i, vid in enumerate(text_vec_ids)
                     ]
-                    return IngestionResult(
+                    result = IngestionResult(
                         document_id=existing_doc.document_id,
                         source=source_ref,
                         chunk_count=len(chunks_for_result),
@@ -2463,6 +2575,14 @@ class IngestionPipeline:
                         deduped=True,
                         doc_hash=doc_hash,
                     )
+                    await self.finalize_ingest_lifecycle(
+                        tenant_id=ns_config.tenant_id,
+                        namespace=namespace,
+                        document_id=result.document_id,
+                        doc_hash=doc_hash,
+                        session_id=session_id,
+                    )
+                    return result
 
             if existing_doc:
                 # PATH B: Fast link
@@ -2525,12 +2645,7 @@ class IngestionPipeline:
                     for i, vid in enumerate(text_vec_ids)
                 ]
 
-                # Update namespace-docs index
-                await self.document_registry.add_doc_to_namespace_index(
-                    namespace, doc_hash, existing_doc.document_id
-                )
-
-                return IngestionResult(
+                result = IngestionResult(
                     document_id=existing_doc.document_id,
                     source=source_ref,
                     chunk_count=len(chunks_for_result),
@@ -2539,6 +2654,14 @@ class IngestionPipeline:
                     deduped=True,
                     doc_hash=doc_hash,
                 )
+                await self.finalize_ingest_lifecycle(
+                    tenant_id=ns_config.tenant_id,
+                    namespace=namespace,
+                    document_id=result.document_id,
+                    doc_hash=doc_hash,
+                    session_id=session_id,
+                )
+                return result
             
             # PATH A: Full Ingestion
             await self.document_registry.register_document(
@@ -2584,12 +2707,7 @@ class IngestionPipeline:
                 chunk_content_hashes=chunk_hashes,
             )
             
-            # Update namespace-docs index
-            await self.document_registry.add_doc_to_namespace_index(
-                namespace, doc_hash, doc_id
-            )
-
-            return IngestionResult(
+            result = IngestionResult(
                 document_id=doc_id,
                 source=source_ref,
                 chunk_count=len(chunks),
@@ -2599,6 +2717,14 @@ class IngestionPipeline:
                 deduped=False,
                 doc_hash=doc_hash,
             )
+            await self.finalize_ingest_lifecycle(
+                tenant_id=ns_config.tenant_id,
+                namespace=namespace,
+                document_id=result.document_id,
+                doc_hash=doc_hash,
+                session_id=session_id,
+            )
+            return result
         except Exception as e:
             logger.exception(f"Error ingesting text: {doc_id}")
             return IngestionResult(doc_id, source_ref, errors=[str(e)])
@@ -2623,6 +2749,30 @@ class IngestionPipeline:
                 return True
         return False
 
+    async def _shared_document_still_exists(
+        self,
+        tenant_id: str,
+        document_hash: str,
+    ) -> bool:
+        """Return ``True`` when this logical document still belongs to other namespaces."""
+        remaining_entry = await self.document_registry.get_document(
+            tenant_id, document_hash
+        )
+        return bool(remaining_entry and remaining_entry.namespaces)
+
+    async def _vector_doc_ids(
+        self,
+        vid: str,
+        namespace: str,
+        collection: str,
+    ) -> List[str]:
+        vec = await self.vector_store.get_by_id(
+            vid, collection=collection, namespace=namespace
+        )
+        if not vec:
+            return []
+        return list(vec.metadata.get("source_doc_ids") or [])
+
     async def _remove_vector_smart(
         self,
         vid: str,
@@ -2630,9 +2780,31 @@ class IngestionPipeline:
         document_id: str,
         collection: str,
         result: DeleteResult,
+        preserve_document_provenance: bool = False,
     ) -> None:
         """Two-step vector removal: dissociate the document, then
         conditionally remove the namespace."""
+        if preserve_document_provenance:
+            current_doc_ids = await self._vector_doc_ids(
+                vid, namespace, collection
+            )
+            if current_doc_ids and await self._namespace_still_needed(
+                current_doc_ids, namespace
+            ):
+                result.vectors_unlinked += 1
+                return
+
+            success, was_last = await self.vector_store.remove_namespace(
+                vid, namespace, collection=collection
+            )
+            if not success:
+                return
+            if was_last:
+                result.vectors_deleted += 1
+            else:
+                result.vectors_unlinked += 1
+            return
+
         remaining = await self.vector_store.remove_document_reference(
             vid, document_id, collection=collection
         )
@@ -2657,8 +2829,31 @@ class IngestionPipeline:
         document_id: str,
         result: DeleteResult,
         is_node: bool = True,
+        preserve_document_provenance: bool = False,
     ) -> None:
         """Two-step graph element removal."""
+        if preserve_document_provenance:
+            current_doc_ids = await self.graph_store.get_document_references(
+                gid, namespace
+            )
+            if current_doc_ids and await self._namespace_still_needed(
+                current_doc_ids, namespace
+            ):
+                if is_node:
+                    result.nodes_unlinked += 1
+                return
+
+            success, was_last = await self.graph_store.remove_namespace(
+                gid, namespace
+            )
+            if not success:
+                return
+            if was_last:
+                result.nodes_deleted += 1
+            else:
+                result.nodes_unlinked += 1
+            return
+
         remaining = await self.graph_store.remove_document_reference(
             gid, document_id
         )
@@ -2703,6 +2898,9 @@ class IngestionPipeline:
 
         # Update registry namespaces first (typed IDs remain on entry)
         await self.document_registry.remove_namespace(tenant_id, document_hash, namespace)
+        preserve_document_provenance = await self._shared_document_still_exists(
+            tenant_id, document_hash
+        )
 
         result = DeleteResult(found=True)
 
@@ -2714,7 +2912,12 @@ class IngestionPipeline:
             )
             for vid in entry.text_vector_ids:
                 await self._remove_vector_smart(
-                    vid, namespace, entry.document_id, text_col, result
+                    vid,
+                    namespace,
+                    entry.document_id,
+                    text_col,
+                    result,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
 
         # ENTITIES
@@ -2724,7 +2927,12 @@ class IngestionPipeline:
             )
             for vid in entry.entity_vector_ids:
                 await self._remove_vector_smart(
-                    vid, namespace, entry.document_id, ent_col, result
+                    vid,
+                    namespace,
+                    entry.document_id,
+                    ent_col,
+                    result,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
 
         # RELATIONS
@@ -2734,7 +2942,12 @@ class IngestionPipeline:
             )
             for vid in entry.relation_vector_ids:
                 await self._remove_vector_smart(
-                    vid, namespace, entry.document_id, rel_col, result
+                    vid,
+                    namespace,
+                    entry.document_id,
+                    rel_col,
+                    result,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
 
         # PAGE IMAGES — image CAS cleanup first (needs vector metadata), then vector removal
@@ -2777,7 +2990,12 @@ class IngestionPipeline:
                         )
             for vid in entry.page_image_vector_ids:
                 await self._remove_vector_smart(
-                    vid, namespace, entry.document_id, page_col, result
+                    vid,
+                    namespace,
+                    entry.document_id,
+                    page_col,
+                    result,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
 
         # --- Graph clean-up ---
@@ -2786,12 +3004,22 @@ class IngestionPipeline:
             # Nodes
             for nid in entry.graph_node_ids:
                 await self._remove_graph_smart(
-                    nid, namespace, entry.document_id, result, is_node=True
+                    nid,
+                    namespace,
+                    entry.document_id,
+                    result,
+                    is_node=True,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
             # Edges
             for eid in entry.graph_edge_ids:
                 await self._remove_graph_smart(
-                    eid, namespace, entry.document_id, result, is_node=False
+                    eid,
+                    namespace,
+                    entry.document_id,
+                    result,
+                    is_node=False,
+                    preserve_document_provenance=preserve_document_provenance,
                 )
 
         # --- CAS / ContentStore clean-up ---
@@ -2835,7 +3063,25 @@ class IngestionPipeline:
 
         if self.sparse_store and entry.chunk_content_hashes:
             try:
-                if hasattr(self.sparse_store, "remove_document_reference"):
+                if (
+                    preserve_document_provenance
+                    and hasattr(self.sparse_store, "get_document_references")
+                ):
+                    hashes_to_delete: List[str] = []
+                    for h in entry.chunk_content_hashes:
+                        remaining_doc_ids = await self.sparse_store.get_document_references(h)
+                        if remaining_doc_ids and await self._namespace_still_needed(
+                            remaining_doc_ids, namespace
+                        ):
+                            continue
+                        hashes_to_delete.append(h)
+
+                    if hashes_to_delete:
+                        await self.sparse_store.delete(
+                            doc_ids=hashes_to_delete,
+                            namespace=namespace,
+                        )
+                elif hasattr(self.sparse_store, "remove_document_reference"):
                     remaining_map = await self.sparse_store.remove_document_reference(
                         doc_ids=entry.chunk_content_hashes,
                         namespace=namespace,
@@ -2859,4 +3105,9 @@ class IngestionPipeline:
             except Exception as e:
                 logger.error(f"Sparse index delete failed: {e}")
 
+        await self.finalize_delete_lifecycle(
+            tenant_id=tenant_id,
+            namespace=namespace,
+            doc_hash=document_hash,
+        )
         return result

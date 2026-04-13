@@ -538,6 +538,36 @@ class Neo4jGraphStore(GraphStoreBackend):
 
         return []
 
+    async def get_document_references(
+        self,
+        id: str,
+        namespace: str,
+    ) -> List[str]:
+        """Return current ``source_doc_ids`` for a node or edge."""
+        query_node = """
+        MATCH (n:Entity {id: $id})
+        WHERE $namespace IN n.namespaces
+        RETURN n.source_doc_ids AS doc_ids
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query_node, id=id, namespace=namespace)
+            record = await result.single()
+            if record is not None:
+                return list(record["doc_ids"] or [])
+
+        query_edge = """
+        MATCH ()-[r]->()
+        WHERE r.id = $id AND $namespace IN r.namespaces
+        RETURN r.source_doc_ids AS doc_ids
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query_edge, id=id, namespace=namespace)
+            record = await result.single()
+            if record is not None:
+                return list(record["doc_ids"] or [])
+
+        return []
+
     # ------------------------------------------------------------------
     # Query operations
     # ------------------------------------------------------------------

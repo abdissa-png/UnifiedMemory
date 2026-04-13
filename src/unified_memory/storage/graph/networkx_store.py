@@ -545,6 +545,24 @@ class NetworkXGraphStore(GraphStoreBackend):
 
         return []
 
+    async def get_document_references(
+        self,
+        id: str,
+        namespace: str,
+    ) -> List[str]:
+        """Return current ``source_doc_ids`` for a node or edge."""
+        async with self._lock:
+            if self._graph.has_node(id):
+                data = self._graph.nodes[id]
+                if self._ns_matches(data, namespace):
+                    return list(data.get("source_doc_ids") or [])
+
+            for u, v, k, data in self._graph.edges(keys=True, data=True):
+                if k == id and self._ns_matches(data, namespace):
+                    return list(data.get("source_doc_ids") or [])
+
+        return []
+
     async def personalized_pagerank(
         self,
         seed_nodes: List[str],

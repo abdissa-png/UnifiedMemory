@@ -336,5 +336,15 @@ class ElasticSearchStore:
                 continue
         return remaining_map
 
+    @external_call()
+    async def get_document_references(self, content_id: str) -> List[str]:
+        """Return current ``source_doc_ids`` for a sparse document."""
+        try:
+            doc = await self._es.get(index=self._index, id=content_id)
+            src = doc.get("_source", {}) or {}
+            return list(src.get("source_doc_ids") or [])
+        except NotFoundError:
+            return []
+
     async def close(self) -> None:
         await self._es.close()

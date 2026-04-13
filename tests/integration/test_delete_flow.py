@@ -70,6 +70,8 @@ async def test_multi_user_delete_flow(ingestion_pipeline, provider_registry, nam
     # 4. Verify User 2 STILL CAN
     res2_after = await retriever.retrieve("Shared", namespaces=[ns2], embedding_provider=embedder)
     assert len(res2_after) > 0
+    assert res2_after[0].metadata.get("source_doc_ids"), "shared delete should preserve source_doc_ids"
+    assert res2_after[0].metadata.get("source_locations"), "shared delete should preserve source_locations"
     
     # 5. User 2 deletes (second/last namespace)
     delete_result_2 = await ingestion_pipeline.delete_document(
