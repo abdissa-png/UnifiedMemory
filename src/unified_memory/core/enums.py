@@ -3,9 +3,9 @@ Enums for the unified memory system.
 """
 
 from __future__ import annotations
-from enum import Enum
+from enum import StrEnum
 
-class MemoryType(Enum):
+class MemoryType(StrEnum):
     """Types of memories."""
 
     EPISODIC = "episodic"
@@ -15,7 +15,7 @@ class MemoryType(Enum):
     PREFERENCE = "preference"
 
 
-class MemoryStatus(Enum):
+class MemoryStatus(StrEnum):
     """Memory validity status."""
 
     VALID = "valid"
@@ -24,7 +24,7 @@ class MemoryStatus(Enum):
     PENDING = "pending"
 
 
-class MemoryLayer(Enum):
+class MemoryLayer(StrEnum):
     """H-MEM memory layers."""
 
     L1_WORKING = "l1_working"
@@ -33,7 +33,7 @@ class MemoryLayer(Enum):
     L4_ARCHIVAL = "l4_archival"
 
 
-class Permission(Enum):
+class Permission(StrEnum):
     """
     Namespace permission types.
 
@@ -47,14 +47,14 @@ class Permission(Enum):
     SHARE = "share"  # Can share namespace with others
 
 
-class ACLEffect(Enum):
+class ACLEffect(StrEnum):
     """ACL rule effect (allow or deny)."""
 
     ALLOW = "allow"
     DENY = "deny"
 
 
-class SourceType(Enum):
+class SourceType(StrEnum):
     """Source types for entity provenance (from MMKG_DESIGN)."""
 
     TEXT_BLOCK = "text_block"
@@ -65,7 +65,7 @@ class SourceType(Enum):
     CONVERSATION = "conversation"  # Added for Mem0-style memories
 
 
-class CollectionType(Enum):
+class CollectionType(StrEnum):
     """Vector collection types (tenant-level physical collections)."""
 
     TEXTS = "texts"  # Document chunks
@@ -75,7 +75,7 @@ class CollectionType(Enum):
     MEMORIES = "memories"  # Consolidated memories (Mem0-style)
 
 
-class Modality(Enum):
+class Modality(StrEnum):
     """
     Content modalities - UNIFIED from both docs.
 
@@ -99,7 +99,7 @@ class Modality(Enum):
     SHARED = "shared"  # aligned embedding space, not an input modality
 
 
-class ConsolidationAction(Enum):
+class ConsolidationAction(StrEnum):
     """Memory consolidation actions."""
 
     ADD = "add"
@@ -110,7 +110,7 @@ class ConsolidationAction(Enum):
     NOOP = "noop"
 
 
-class NodeType(Enum):
+class NodeType(StrEnum):
     """Enumeration of valid node types."""
 
     ENTITY = "entity"
