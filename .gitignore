@@ -12,3 +12,5 @@ old_docs/
 docs/website/node_modules/
 docs/website/.docusaurus/
 docs/website/build/
+**/*.log
+**/*.ipynb
