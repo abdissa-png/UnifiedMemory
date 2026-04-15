@@ -1,5 +1,5 @@
 import tiktoken
-
+from tiktoken.model import MODEL_TO_ENCODING
 _encoder = None
 
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
@@ -16,7 +16,7 @@ def count_tokens(text: str, model: str = "gpt-4o") -> int:
 class ContextWindowManager:
     def __init__(self, max_tokens: int = 4000, model: str = "gpt-4o"):
         self.max_tokens = max_tokens
-        self.tokenizer = tiktoken.encoding_for_model(model)
+        self.tokenizer = tiktoken.encoding_for_model(model if model in MODEL_TO_ENCODING else "gpt-4o")
 
     def fit_results(self, results: list, reserved_tokens: int = 500) -> list:
         """Return as many full results as fit in the context window."""
