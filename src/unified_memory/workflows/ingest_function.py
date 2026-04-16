@@ -29,6 +29,8 @@ def create_ingest_function(
     Called once at bootstrap time; the returned function object is
     registered with the Inngest serve handler.
     """
+    from unified_memory.observability.tracing import set_request_context
+    from unified_memory.workflows.error_sanitize import sanitize_workflow_error_text
     from unified_memory.workflows.client import get_inngest_client
     from unified_memory.workflows.events import DOCUMENT_UPLOADED, DOCUMENT_DELETE_REQUESTED
     from unified_memory.workflows.job_state import (
@@ -66,11 +68,16 @@ def create_ingest_function(
     )
     async def ingest_document(
         ctx: inngest.Context,
-        step: inngest.Step,
     ) -> dict:
+        step = ctx.step
         data = ctx.event.data
         tenant_id = data["tenant_id"]
         namespace = data["namespace"]
+        user_id = str(data.get("user_id") or "")
+
+        set_request_context(
+            tenant_id=tenant_id, namespace=namespace, user_id=user_id
+        )
         document_id = data.get("document_id") or str(uuid.uuid4())
         source_path = data.get("source_path")
         source_text = data.get("source_text")
@@ -120,14 +127,17 @@ def create_ingest_function(
                 ),
             )
             if parse_result.get("error"):
-                job_state.mark_failed(parse_result["error"])
+                err_safe = sanitize_workflow_error_text(
+                    str(parse_result["error"])
+                )
+                job_state.mark_failed(err_safe)
                 await save_job_state(kv_store, job_state)
                 if is_file and source_path and os.path.exists(source_path):
                     await step.run(
                         "cleanup-source-file",
                         lambda: os.unlink(source_path),
                     )
-                return {"status": "parse_error", "error": parse_result["error"]}
+                return {"status": "parse_error", "error": err_safe}
 
             job_state.mark_stage(JobStage.PARSED)
             job_state.parsed_artifact_uri = parse_result.get("parsed_artifact_uri", "")

@@ -22,6 +22,7 @@ def create_delete_function(pipeline: "IngestionPipeline"):
     Called once at bootstrap time; the returned function object is
     registered with the Inngest serve handler.
     """
+    from unified_memory.observability.tracing import set_request_context
     from unified_memory.workflows.client import get_inngest_client
     from unified_memory.workflows.events import DOCUMENT_DELETE_REQUESTED
     from unified_memory.workflows.job_state import (
@@ -50,11 +51,16 @@ def create_delete_function(pipeline: "IngestionPipeline"):
     )
     async def delete_document(
         ctx: inngest.Context,
-        step: inngest.Step,
     ) -> dict:
+        step = ctx.step
         data = ctx.event.data
         tenant_id = data["tenant_id"]
         namespace = data["namespace"]
+        user_id = str(data.get("user_id") or "")
+
+        set_request_context(
+            tenant_id=tenant_id, namespace=namespace, user_id=user_id
+        )
         doc_hash = data["doc_hash"]
         job_id = data.get("job_id")
         job_state = IngestionJobState(

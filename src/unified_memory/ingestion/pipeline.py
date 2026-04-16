@@ -47,6 +47,8 @@ from unified_memory.ingestion.chunkers.recursive import RecursiveChunker
 from unified_memory.ingestion.chunkers.semantic import SemanticChunker
 from unified_memory.namespace.types import TenantConfig
 from unified_memory.observability.tracing import traced
+from unified_memory.workflows.error_sanitize import sanitize_workflow_error_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -911,7 +913,11 @@ class IngestionPipeline:
                 logger.exception(
                     "Failed to process chunk hash %s", content_hash
                 )
-                errors.append(f"Chunk processing error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Chunk processing error: {e!s}"
+                    )
+                )
 
         if vectors_to_upsert:
             try:
@@ -920,7 +926,9 @@ class IngestionPipeline:
                 )
             except Exception as e:
                 logger.error(f"Batch text vector upsert failed: {e}")
-                errors.append(f"Vector batch error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(f"Vector batch error: {e!s}")
+                )
 
         return {"text_vector_ids": text_vector_ids, "errors": errors}
 
@@ -953,7 +961,9 @@ class IngestionPipeline:
                 await self.sparse_store.index(sparse_docs, namespace)
             except Exception as e:
                 logger.error(f"Sparse index upsert failed: {e}")
-                errors.append(f"Sparse index error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(f"Sparse index error: {e!s}")
+                )
 
         return {"indexed": len(sparse_docs), "errors": errors}
 
@@ -1196,8 +1206,10 @@ class IngestionPipeline:
                     final_edges, namespace
                 )
         except Exception as e:
-            logger.error(f"Batch graph creation failed: {e}")
-            errors.append(f"Graph batch error: {str(e)}")
+            logger.error("Batch graph creation failed: %s", e, exc_info=True)
+            errors.append(
+                sanitize_workflow_error_text(f"Graph batch error: {e!s}")
+            )
 
         graph_edge_ids: List[str] = [edge.id for edge in final_edges]
 
@@ -1256,16 +1268,23 @@ class IngestionPipeline:
 
         ent_desc_uri = ""
         rel_desc_uri = ""
-        if artifact_store and job_id:
+        job_segment = job_id or "adhoc"
+        if artifact_store:
             if entity_descriptors:
                 ent_desc_uri = await artifact_store.put_json(
                     {"descriptors": entity_descriptors},
-                    key=f"jobs/{job_id}/graph/{document_id}_entities.json",
+                    key=(
+                        f"jobs/{job_segment}/graph/"
+                        f"{tenant_id}_{document_id}_entities.json"
+                    ),
                 )
             if relation_descriptors:
                 rel_desc_uri = await artifact_store.put_json(
                     {"descriptors": relation_descriptors},
-                    key=f"jobs/{job_id}/graph/{document_id}_relations.json",
+                    key=(
+                        f"jobs/{job_segment}/graph/"
+                        f"{tenant_id}_{document_id}_relations.json"
+                    ),
                 )
 
         result: dict = {
@@ -1278,13 +1297,21 @@ class IngestionPipeline:
 
         if ent_desc_uri:
             result["entity_descriptors_uri"] = ent_desc_uri
-        else:
-            result["entity_descriptors"] = entity_descriptors
+        elif entity_descriptors:
+            logger.warning(
+                "graph.extract missing artifact_store; omitting "
+                "entity_descriptors from step output (count=%s)",
+                len(entity_descriptors),
+            )
 
         if rel_desc_uri:
             result["relation_descriptors_uri"] = rel_desc_uri
-        else:
-            result["relation_descriptors"] = relation_descriptors
+        elif relation_descriptors:
+            logger.warning(
+                "graph.extract missing artifact_store; omitting "
+                "relation_descriptors from step output (count=%s)",
+                len(relation_descriptors),
+            )
 
         return result
 
@@ -1382,8 +1409,12 @@ class IngestionPipeline:
                 )
                 entity_vector_ids = [v["id"] for v in ent_vector_data]
             except Exception as e:
-                logger.error(f"Entity embedding/storage failed: {e}")
-                errors.append(f"Entity semantic index error: {str(e)}")
+                logger.error("Entity embedding/storage failed: %s", e, exc_info=True)
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Entity semantic index error: {e!s}"
+                    )
+                )
 
         if relation_descriptors:
             rel_collection = (
@@ -1451,8 +1482,12 @@ class IngestionPipeline:
                 )
                 relation_vector_ids = [v["id"] for v in rel_vector_data]
             except Exception as e:
-                logger.error(f"Relation embedding failed: {e}")
-                errors.append(f"Relation embedding error: {str(e)}")
+                logger.error("Relation embedding failed: %s", e, exc_info=True)
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Relation embedding error: {e!s}"
+                    )
+                )
 
         return {
             "entity_vector_ids": entity_vector_ids,
@@ -1578,8 +1613,10 @@ class IngestionPipeline:
                     v["id"] for v in vision_vectors
                 ]
         except Exception as e:
-            logger.error(f"Vision embedding failed: {e}")
-            errors.append(f"Vision embedding error: {str(e)}")
+            logger.error("Vision embedding failed: %s", e, exc_info=True)
+            errors.append(
+                sanitize_workflow_error_text(f"Vision embedding error: {e!s}")
+            )
 
         return {
             "page_image_vector_ids": page_image_vector_ids,
@@ -1950,7 +1987,11 @@ class IngestionPipeline:
 
             except Exception as e:
                 logger.exception(f"Failed to process chunk {i}")
-                errors.append(f"Chunk {i} processing error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Chunk {i} processing error: {e!s}"
+                    )
+                )
 
 
         # 4. Batch Operations for Vector and Graph stores (P0 fix #3)
@@ -2006,7 +2047,9 @@ class IngestionPipeline:
                 )
             except Exception as e:
                 logger.error(f"Batch text vector upsert failed: {e}")
-                errors.append(f"Vector batch error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(f"Vector batch error: {e!s}")
+                )
  
         # 4.1.5 Batch sparse upsert (BM25)
         if self.sparse_store and sparse_docs_to_upsert:
@@ -2015,7 +2058,9 @@ class IngestionPipeline:
             except Exception as e:
                 logger.error(f"Sparse index upsert failed: {e}")
                 # We don't fail the whole ingest for sparse index errors, but log it
-                errors.append(f"Sparse index error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(f"Sparse index error: {e!s}")
+                )
 
         # 4.2 Graph nodes/edges
         if self.graph_store and (final_nodes_to_create or final_edges_to_create):
@@ -2026,7 +2071,9 @@ class IngestionPipeline:
                     await self.graph_store.create_edges_batch(final_edges_to_create, namespace)
             except Exception as e:
                 logger.error(f"Batch graph creation failed: {e}")
-                errors.append(f"Graph batch error: {str(e)}")
+                errors.append(
+                    sanitize_workflow_error_text(f"Graph batch error: {e!s}")
+                )
 
         # 4.5 Vision Embeddings (Phase 2.3)
         vision_embedder = self._resolve_vision_embedder_from_tenant(tenant_config)
@@ -2104,8 +2151,12 @@ class IngestionPipeline:
                     all_vector_ids.extend(ids)
                     page_image_vector_ids.extend(ids)
             except Exception as e:
-                logger.error(f"Vision embedding failed: {e}")
-                errors.append(f"Vision embedding error: {str(e)}")
+                logger.error("Vision embedding failed: %s", e, exc_info=True)
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Vision embedding error: {e!s}"
+                    )
+                )
 
         # 5. Entity/Relation Embeddings (P0 fix #2)
         # Skip if skip_embedding is True (assuming entities are also covered by existing doc check? 
@@ -2174,7 +2225,11 @@ class IngestionPipeline:
                         entity_vector_ids.extend(ids)
                     except Exception as e:
                         logger.error(f"Entity embedding/storage failed: {e}")
-                        errors.append(f"Entity semantic index error: {str(e)}")
+                        errors.append(
+                            sanitize_workflow_error_text(
+                                f"Entity semantic index error: {e!s}"
+                            )
+                        )
 
         # 5.5 Relation Embeddings (Phase 2.4)
         if self.vector_store and final_edges_to_create and not skip_embedding:
@@ -2237,8 +2292,12 @@ class IngestionPipeline:
                     all_vector_ids.extend(ids)
                     relation_vector_ids.extend(ids)
             except Exception as e:
-                logger.error(f"Relation embedding failed: {e}")
-                errors.append(f"Relation embedding error: {str(e)}")
+                logger.error("Relation embedding failed: %s", e, exc_info=True)
+                errors.append(
+                    sanitize_workflow_error_text(
+                        f"Relation embedding error: {e!s}"
+                    )
+                )
 
         # Collect all edge IDs as well for registry/delete flows
         for edge in edges_to_create:

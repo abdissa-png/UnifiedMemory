@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from unified_memory.core.utils import utc_now
+from unified_memory.workflows.error_sanitize import sanitize_workflow_error_text
 
 
 class JobStatus(str, Enum):
@@ -122,7 +123,7 @@ class IngestionJobState:
     def mark_failed(self, error: str) -> None:
         self.status = JobStatus.FAILED
         self.stage = JobStage.FAILED
-        self.error = error
+        self.error = sanitize_workflow_error_text(error)
         self.updated_at = utc_now().isoformat()
 
 
