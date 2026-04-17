@@ -158,6 +158,7 @@ class TokenUsageRecord(Base):
     id = Column(String(64), primary_key=True)
     trace_id = Column(String(64), nullable=False, index=True)
     tenant_id = Column(String(64), nullable=False)
+    user_id = Column(String(64), default="", nullable=False)
     namespace = Column(String(512), default="")
     service = Column(String(64), nullable=False)
     model = Column(String(128), nullable=False)
@@ -175,4 +176,10 @@ class TokenUsageRecord(Base):
 
     __table_args__ = (
         Index("ix_usage_tenant_model_created", "tenant_id", "model", "created_at"),
+        Index(
+            "ix_usage_user_model_created",
+            "user_id",
+            "model",
+            "created_at",
+        ),
     )

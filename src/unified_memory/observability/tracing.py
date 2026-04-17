@@ -86,6 +86,7 @@ class TraceUsageContext:
     trace_id: str
     tenant_id: str = ""
     namespace: str = ""
+    user_id: str = ""
     records: List[UsageRecord] = field(default_factory=list)
 
 
@@ -95,6 +96,7 @@ _usage_context: ContextVar[Optional[TraceUsageContext]] = ContextVar(
 )
 _request_tenant_id: ContextVar[str] = ContextVar("_request_tenant_id", default="")
 _request_namespace: ContextVar[str] = ContextVar("_request_namespace", default="")
+_request_user_id: ContextVar[str] = ContextVar("_request_user_id", default="")
 
 # SQL flush callback — set by bootstrap when SQL is available
 _flush_callback: Optional[Callable] = None
@@ -106,13 +108,31 @@ def set_flush_callback(cb: Callable) -> None:
     _flush_callback = cb
 
 
-def set_request_context(*, tenant_id: str = "", namespace: str = "") -> None:
-    """Set request-scoped tenant/namespace (called by middleware)."""
-    if tenant_id:
-        _request_tenant_id.set(tenant_id)
-    if namespace:
-        _request_namespace.set(namespace)
-    bind_log_context(tenant_id=tenant_id, namespace=namespace)
+def set_request_context(
+    *,
+    tenant_id: str = "",
+    namespace: str = "",
+    user_id: str = "",
+) -> None:
+    """Set request-scoped tenant/namespace/user (middleware or Inngest entry)."""
+    _request_tenant_id.set(tenant_id)
+    _request_namespace.set(namespace)
+    _request_user_id.set(user_id)
+    bind_log_context(tenant_id=tenant_id, namespace=namespace, user_id=user_id)
+
+
+def user_id_for_token_usage(ctx: TraceUsageContext) -> str:
+    """Resolve ``token_usage.user_id`` from the canonical namespace string.
+
+    Expected shape: ``tenant:{id}/user:{id}/…`` (see ``Namespace.from_string``).
+    If ``namespace`` is empty, fall back to the explicit request ``user_id``.
+    """
+    ns = (ctx.namespace or "").strip()
+    if ns:
+        from unified_memory.namespace.types import Namespace
+
+        return Namespace.from_string(ns).user_id
+    return ctx.user_id or ""
 
 
 def record_usage(record: UsageRecord) -> None:
@@ -148,6 +168,7 @@ def traced(operation_name: str):
                     trace_id=uuid.uuid4().hex,
                     tenant_id=_request_tenant_id.get(""),
                     namespace=_request_namespace.get(""),
+                    user_id=_request_user_id.get(""),
                 )
                 _usage_context.set(ctx)
             else:
