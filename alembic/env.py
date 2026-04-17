@@ -17,17 +17,25 @@ from unified_memory.storage.sql.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Do not disable app loggers (e.g. unified_memory.*) when Alembic runs
+    # from the API lifespan — the default breaks console logging after migrate.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # ---------------------------------------------------------------------------
 # Database URL (REQUIRED)
 # ---------------------------------------------------------------------------
 
-database_url = os.environ.get("UMS_DATABASE_URL")
+# Prefer URL already on the Config (e.g. ``init_db`` passes the same URL as
+# the running app). Otherwise use the environment variable so CLI invocations
+# still work without duplicating defaults in two places.
+database_url = config.get_main_option("sqlalchemy.url") or ""
 if not database_url:
-    raise RuntimeError("UMS_DATABASE_URL environment variable is not set")
-
-# Inject into Alembic config
+    database_url = os.environ.get("UMS_DATABASE_URL") or ""
+if not database_url:
+    raise RuntimeError(
+        "Database URL is not set: configure sqlalchemy.url on the Alembic "
+        "Config or set UMS_DATABASE_URL in the environment."
+    )
 config.set_main_option("sqlalchemy.url", database_url)
 
 # ---------------------------------------------------------------------------
