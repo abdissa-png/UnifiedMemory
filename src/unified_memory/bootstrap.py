@@ -45,6 +45,7 @@ from unified_memory.retrieval.unified import UnifiedSearchService
 from unified_memory.retrieval.dense import DenseRetriever
 from unified_memory.retrieval.graph import GraphRetriever
 from unified_memory.namespace.tenant_manager import TenantManager
+from unified_memory.core.types import Modality
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,10 @@ class SystemContext:
 
         self._register_providers(config)
 
-        self.tenant_manager = TenantManager(self.kv_store)
+        self.tenant_manager = TenantManager(
+            self.kv_store,
+            vector_store=self.vector_store,
+        )
 
         self.ingestion_pipeline: Optional[IngestionPipeline] = None
         self.search_service: Optional[UnifiedSearchService] = None
@@ -487,14 +491,19 @@ class SystemContext:
         #   "text"   (default) → text embedding registry
         #   "vision" or "image" → vision embedding registry
         for key, emb_cfg in config.get("embedding_providers", {}).items():
-            provider = self._build_embedding_provider(emb_cfg)
+            modalities = self._parse_embedding_modalities(
+                emb_cfg.get("modality", "text")
+            )
+            provider = self._build_embedding_provider(
+                emb_cfg,
+                modalities=modalities,
+            )
             if not provider:
                 continue
-            modality = emb_cfg.get("modality", "text").lower()
-            if modality in ("vision", "image"):
-                self.provider_registry.register_vision_embedding_provider(key, provider)
-            else:
+            if any(m in (Modality.TEXT, Modality.SHARED) for m in modalities):
                 self.provider_registry.register_embedding_provider(key, provider)
+            if any(m in (Modality.IMAGE, Modality.DOCUMENT, Modality.SHARED) for m in modalities):
+                self.provider_registry.register_vision_embedding_provider(key, provider)
 
         # LLM providers (stored in registry for extractor use + QA agent)
         llm_instances: Dict[str, Any] = {}
@@ -517,7 +526,11 @@ class SystemContext:
                 self.provider_registry.register_reranker(key, reranker)
 
     @staticmethod
-    def _build_embedding_provider(emb_cfg: Dict[str, Any]):
+    def _build_embedding_provider(
+        emb_cfg: Dict[str, Any],
+        *,
+        modalities: list[Modality],
+    ):
         prov = emb_cfg.get("provider", "mock")
         if prov == "mock":
             from unified_memory.embeddings.providers.mock_provider import (
@@ -526,6 +539,7 @@ class SystemContext:
 
             return MockEmbeddingProvider(
                 dimension=emb_cfg.get("dimension", 128),
+                modalities=modalities,
             )
         if prov == "openai":
             from unified_memory.embeddings.providers.openai_provider import (
@@ -537,9 +551,44 @@ class SystemContext:
                 model=emb_cfg.get("model", "text-embedding-3-small"),
                 dimension=emb_cfg.get("dimension", 1536),
                 base_url=emb_cfg.get("base_url"),
+                supported_modalities=modalities,
             )
         logger.warning("Unsupported embedding provider '%s'", prov)
         return None
+
+    @staticmethod
+    def _parse_embedding_modalities(raw: Any) -> list[Modality]:
+        if isinstance(raw, list):
+            raw_values = raw
+        else:
+            raw_values = [raw]
+
+        parsed: list[Modality] = []
+        for item in raw_values:
+            if isinstance(item, Modality):
+                parsed.append(item)
+                continue
+            value = str(item or "").strip().lower()
+            if not value:
+                continue
+            if value in ("vision", "image"):
+                parsed.append(Modality.IMAGE)
+            elif value == "document":
+                parsed.append(Modality.DOCUMENT)
+            elif value == "shared":
+                parsed.append(Modality.SHARED)
+                parsed.extend([Modality.TEXT, Modality.IMAGE])
+            else:
+                parsed.append(Modality.TEXT)
+
+        if not parsed:
+            parsed = [Modality.TEXT]
+        # Preserve order while removing duplicates.
+        unique: list[Modality] = []
+        for modality in parsed:
+            if modality not in unique:
+                unique.append(modality)
+        return unique
 
     @staticmethod
     def _build_llm_provider(llm_cfg: Dict[str, Any]):
