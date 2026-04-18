@@ -7,6 +7,8 @@ Requires the `openai` package.
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from typing import Any, List, Optional
 
@@ -33,7 +35,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         model: str = "text-embedding-3-small",
         dimension: int = 1536,
         base_url: Optional[str] = None,
-        max_batch_size: int = 2048,
+        max_batch_size_text: int = 2048,
+        max_batch_size_image: int = 20,
+        supported_modalities: Optional[List[Modality]] = None,
     ) -> None:
         try:
             from openai import AsyncOpenAI
@@ -49,7 +53,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self._client = AsyncOpenAI(**client_kwargs)
         self._model = model
         self._dimension = dimension
-        self._max_batch_size = max_batch_size
+        self._max_batch_size_text = max_batch_size_text
+        self._max_batch_size_image = max_batch_size_image
+        self._supported_modalities = supported_modalities or [Modality.TEXT]
 
     @property
     def model_id(self) -> str:
@@ -61,7 +67,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 
     @property
     def supported_modalities(self) -> List[Modality]:
-        return [Modality.TEXT]
+        return self._supported_modalities
 
     @external_call()
     async def embed(
@@ -70,9 +76,9 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         modality: Modality = Modality.TEXT,
     ) -> List[float]:
         self.validate_modality(modality)
-        text = content if isinstance(content, str) else str(content)
+        model_input = self._prepare_input(content, modality)
         response = await self._client.embeddings.create(
-            input=[text],
+            input=[model_input],
             model=self._model,
             dimensions=self._dimension,
         )
@@ -86,11 +92,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         modality: Modality = Modality.TEXT,
     ) -> List[List[float]]:
         self.validate_modality(modality)
-        texts = [c if isinstance(c, str) else str(c) for c in contents]
-        all_embeddings: List[List[float]] = [[] for _ in texts]
-
-        for start in range(0, len(texts), self._max_batch_size):
-            batch = texts[start : start + self._max_batch_size]
+        model_inputs = [self._prepare_input(content, modality) for content in contents]
+        all_embeddings: List[List[float]] = [[] for _ in model_inputs]
+        # Batch embedding for image modality is handled differently
+        max_batch_size = self._max_batch_size_image if modality == Modality.IMAGE else self._max_batch_size_text
+        for start in range(0, len(model_inputs), max_batch_size):
+            batch = model_inputs[start : start + max_batch_size]
             response = await self._client.embeddings.create(
                 input=batch,
                 model=self._model,
@@ -101,6 +108,48 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             self._record_usage(response.usage)
 
         return all_embeddings
+
+    def _prepare_input(self, content: Any, modality: Modality) -> Any:
+        if modality == Modality.TEXT:
+            return content if isinstance(content, str) else str(content)
+        if modality in (Modality.IMAGE, Modality.DOCUMENT):
+            return self._prepare_image_input(content)
+        # For modalities beyond image/text, pass through raw content for
+        # compatible backends that implement custom semantics.
+        return content
+
+    def _prepare_image_input(self, content: Any) -> Any:
+        if isinstance(content, dict):
+            image_url = content.get("image_url")
+            if isinstance(image_url, str):
+                return image_url
+            return str(content)
+        if isinstance(content, list):
+            if (
+                len(content) == 1
+                and isinstance(content[0], dict)
+                and isinstance(content[0].get("image_url"), str)
+            ):
+                return content[0]["image_url"]
+            return str(content)
+        if isinstance(content, bytes):
+            encoded = base64.b64encode(content).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+        if isinstance(content, str):
+            value = content.strip()
+            if (
+                value.startswith("http://")
+                or value.startswith("https://")
+                or value.startswith("data:")
+            ):
+                return value
+            return value
+        if hasattr(content, "save"):
+            buf = io.BytesIO()
+            content.save(buf, format="PNG")
+            encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+        return str(content)
 
     def _record_usage(self, usage) -> None:
         """Extract token counts from CreateEmbeddingResponse.usage."""
