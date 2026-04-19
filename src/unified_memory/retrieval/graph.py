@@ -152,7 +152,7 @@ class GraphRetriever:
         other_results: List[RetrievalResult] = []
 
         for node in nodes:
-            node_type = getattr(node, "node_type", None)
+            node_type = getattr(node, "entity_name", None)
             content = node.content or ""
 
             # Hydrate passage content from content_store (graph nodes no longer store it)
@@ -164,7 +164,7 @@ class GraphRetriever:
                         content = stored
 
             metadata = {
-                "node_type": node_type.value if node_type else None,
+                "node_type": node_type if node_type else None,
                 "properties": node.properties,
             }
             # Propagate content_hash when present so fusion can merge graph
@@ -203,5 +203,14 @@ class GraphRetriever:
                 combined.append(r)
                 existing_ids.add(r.id)
 
-        combined.sort(key=lambda x: x.score, reverse=True)
+        # Keep passage nodes ahead of entity/other graph nodes even when
+        # entity centrality is higher, then rank by score within each type.
+        combined.sort(
+            key=lambda x: (
+                0
+                if x.metadata.get("node_type") == NodeType.PASSAGE
+                else 1,
+                -x.score,
+            )
+        )
         return combined[:limit]

@@ -7,6 +7,7 @@ Implements GraphStoreBackend using Neo4j and GDS (Graph Data Science) for PPR.
 from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 import asyncio
+from uuid import uuid4
 from collections import defaultdict
 
 from neo4j import AsyncGraphDatabase
@@ -688,11 +689,27 @@ class Neo4jGraphStore(GraphStoreBackend):
         max_iterations: int = 100,
         top_k: int = 20,
     ) -> List[Tuple[str, float]]:
-        query = """
+        graph_name = f"ppr_{namespace.replace(':', '_').replace('/', '_')}_{uuid4().hex[:12]}"
+        project_query = """
+        CALL gds.graph.project.cypher(
+          $graph_name,
+          'MATCH (n:Entity) WHERE $namespace IN n.namespaces RETURN id(n) AS id',
+          'MATCH (n:Entity)-[r]->(m:Entity)
+           WHERE $namespace IN r.namespaces AND $namespace IN n.namespaces AND $namespace IN m.namespaces
+           RETURN id(n) AS source, id(m) AS target, coalesce(r.weight, 1.0) AS weight
+           UNION ALL
+           MATCH (n:Entity)-[r]->(m:Entity)
+           WHERE $namespace IN r.namespaces AND $namespace IN n.namespaces AND $namespace IN m.namespaces
+           RETURN id(m) AS source, id(n) AS target, coalesce(r.weight, 1.0) AS weight',
+          {parameters: {namespace: $namespace}}
+        )
+        YIELD graphName
+        RETURN graphName
+        """
+        pagerank_query = """
         CALL gds.pageRank.stream(
+          $graph_name,
           {
-            nodeQuery: 'MATCH (n:Entity) WHERE $namespace IN n.namespaces RETURN id(n) as id',
-            relationshipQuery: 'MATCH (n:Entity)-[r]->(m:Entity) WHERE $namespace IN r.namespaces RETURN id(n) as source, id(m) as target, r.weight as weight',
             relationshipWeightProperty: 'weight',
             dampingFactor: $damping,
             maxIterations: $iterations,
@@ -700,11 +717,18 @@ class Neo4jGraphStore(GraphStoreBackend):
           }
         )
         YIELD nodeId, score
-        RETURN gds.util.asNode(nodeId).id AS id, score
-        ORDER BY score DESC
+        WITH gds.util.asNode(nodeId) AS n, score
+        RETURN n.id AS id, score, coalesce(n.node_type, 'entity') AS node_type
+        ORDER BY
+          CASE coalesce(n.node_type, 'entity')
+            WHEN 'passage' THEN 0
+            WHEN 'page' THEN 1
+            ELSE 2
+          END,
+          score DESC
         LIMIT $top_k
         """
-
+        drop_query = "CALL gds.graph.drop($graph_name, false) YIELD graphName RETURN graphName"
         async with self.driver.session() as session:
             id_query = """
             MATCH (n:Entity)
@@ -719,20 +743,35 @@ class Neo4jGraphStore(GraphStoreBackend):
             if not internal_ids:
                 return []
 
-            result = await session.run(
-                query,
-                namespace=namespace,
-                damping=damping,
-                iterations=max_iterations,
-                source_nodes=internal_ids,
-                top_k=top_k,
-            )
+            try:
+                await session.run(
+                    project_query,
+                    graph_name=graph_name,
+                    namespace=namespace,
+                )
 
-            ppr_results = []
-            async for record in result:
-                ppr_results.append((record["id"], record["score"]))
+                result = await session.run(
+                    pagerank_query,
+                    graph_name=graph_name,
+                    damping=damping,
+                    iterations=max_iterations,
+                    source_nodes=internal_ids,
+                    top_k=top_k,
+                )
 
-            return ppr_results
+                ppr_results = []
+                async for record in result:
+                    ppr_results.append((record["id"], record["score"]))
+                return ppr_results
+            finally:
+                try:
+                    await session.run(drop_query, graph_name=graph_name)
+                except Exception:
+                    logger.debug(
+                        "Failed to drop temporary GDS graph '%s'",
+                        graph_name,
+                        exc_info=True,
+                    )
 
     # ------------------------------------------------------------------
     # Helpers

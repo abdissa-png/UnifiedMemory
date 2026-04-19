@@ -575,7 +575,7 @@ class NetworkXGraphStore(GraphStoreBackend):
         async with self._lock:
             # Create subgraph for namespace
             ns_nodes = [n for n, d in self._graph.nodes(data=True) if self._ns_matches(d, namespace)]
-            subgraph = self._graph.subgraph(ns_nodes)
+            subgraph = self._graph.subgraph(ns_nodes).to_undirected()
             
             if not seed_nodes:
                 return []
