@@ -12,7 +12,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from unified_memory.core.exceptions import CASConflictError
-from unified_memory.storage.base import KVStoreBackend
+from unified_memory.storage.base import KVStoreBackend, VectorStoreBackend
 from unified_memory.namespace.types import TenantConfig, EmbeddingModelConfig
 from unified_memory.core.types import Modality
 
@@ -32,6 +32,15 @@ class TenantManager:
     
     def __init__(self, kv_store: KVStoreBackend):
         self.kv_store = kv_store
+        self.vector_store: Optional[VectorStoreBackend] = None
+
+    def __init__(
+        self,
+        kv_store: KVStoreBackend,
+        vector_store: Optional[VectorStoreBackend] = None,
+    ):
+        self.kv_store = kv_store
+        self.vector_store = vector_store
         
     def _key(self, tenant_id: str) -> str:
         return f"tenant_config:{tenant_id}"
@@ -162,4 +171,53 @@ class TenantManager:
         config = TenantConfig(**kw_args)
 
         await self.set_tenant_config(tenant_id, config)
+        await self._provision_vector_collections(config)
         return config
+
+    @staticmethod
+    def _sanitize_collection_name(name: str) -> str:
+        return name.replace("/", "_").replace(":", "_").replace(" ", "_")
+
+    async def _provision_vector_collections(self, config: TenantConfig) -> None:
+        """Ensure tenant-level vector collections exist for real vector backends."""
+        if self.vector_store is None:
+            return
+
+        text_dimension = config.text_embedding.dimension
+        vision_dimension = (
+            config.vision_embedding.dimension
+            if config.vision_embedding is not None
+            else text_dimension
+        )
+
+        existing = await self.vector_store.list_collections()
+        existing_names = set(existing)
+
+        collections = [
+            (f"{config.tenant_id}_texts", text_dimension),
+            (f"{config.tenant_id}_entities", text_dimension),
+            (f"{config.tenant_id}_relations", text_dimension),
+            (f"{config.tenant_id}_page_images", vision_dimension),
+            (f"{config.tenant_id}_memories", text_dimension),
+        ]
+
+        index_cfg = config.index
+        for collection_name, dimension in collections:
+            safe_name = self._sanitize_collection_name(collection_name)
+            if collection_name in existing_names or safe_name in existing_names:
+                continue
+
+            created = await self.vector_store.create_collection(
+                name=collection_name,
+                dimension=dimension,
+                index_type=index_cfg.index_type,
+                hnsw_m=index_cfg.hnsw_m,
+                hnsw_ef_construct=index_cfg.hnsw_ef_construct,
+                ivf_sq_quantile=index_cfg.ivf_sq_quantile,
+            )
+            if not created:
+                logger.warning(
+                    "Failed to provision vector collection '%s' for tenant '%s'",
+                    collection_name,
+                    config.tenant_id,
+                )
