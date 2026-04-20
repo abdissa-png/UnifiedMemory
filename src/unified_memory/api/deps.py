@@ -4,7 +4,7 @@ FastAPI dependency injection: SystemContext, auth, ACL.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import Depends, HTTPException, Request
 
@@ -61,10 +61,27 @@ class ACLChecker:
 
     async def __call__(
         self,
-        namespace: str,
+        request: Request,
+        namespace: Optional[str] = None,
         user: AuthenticatedUser = Depends(get_current_user),
         ctx: "SystemContext" = Depends(get_system_context),
     ) -> "NamespaceConfig":
+        if namespace is None:
+            namespace = request.path_params.get("namespace")
+        if namespace is None: 
+            namespace = request.query_params.get("namespace")
+        if namespace is None:
+            try:
+                form = await request.form()
+                form_namespace = form.get("namespace")
+                if isinstance(form_namespace, str):
+                    namespace = form_namespace
+            except Exception:
+                namespace = None
+
+        if not namespace:
+            raise HTTPException(422, "Namespace is required")
+
         ns_config = await ctx.namespace_manager.get_config(namespace)
         if not ns_config:
             raise HTTPException(404, f"Namespace '{namespace}' not found")
