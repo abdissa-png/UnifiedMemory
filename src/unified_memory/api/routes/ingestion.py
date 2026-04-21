@@ -41,7 +41,7 @@ router = APIRouter(prefix="/v1", tags=["ingestion"])
 # ---------------------------------------------------------------------------
 
 
-@router.post("/ingest/text/{namespace}", response_model=IngestResponse)
+@router.post("/ingest/text/{namespace:path}", response_model=IngestResponse)
 async def ingest_text(
     namespace: str,
     body: IngestTextRequest,
@@ -50,7 +50,18 @@ async def ingest_text(
     user: AuthenticatedUser = Depends(get_current_user),
     ctx=Depends(get_system_context),
 ):
-    set_request_context(tenant_id=user.tenant_id, namespace=namespace)
+    set_request_context(
+        tenant_id=user.tenant_id,
+        namespace=namespace,
+        user_id=user.user_id,
+    )
+    logger.info(
+        "ingest_text.request tenant_id=%s namespace=%s title=%s background=%s",
+        user.tenant_id,
+        namespace,
+        body.title or "",
+        background,
+    )
 
     # ---- async Inngest path ----
     inngest_client = getattr(ctx, "inngest_client", None)
@@ -74,6 +85,7 @@ async def ingest_text(
                     data={
                         "tenant_id": user.tenant_id,
                         "namespace": namespace,
+                        "user_id": user.user_id,
                         "document_id": document_id,
                         "source_text": body.text,
                         "title": body.title,
@@ -141,7 +153,18 @@ async def ingest_file(
 ):
     import tempfile
 
-    set_request_context(tenant_id=user.tenant_id, namespace=namespace)
+    set_request_context(
+        tenant_id=user.tenant_id,
+        namespace=namespace,
+        user_id=user.user_id,
+    )
+    logger.info(
+        "ingest_file.request tenant_id=%s namespace=%s filename=%s background=%s",
+        user.tenant_id,
+        namespace,
+        file.filename or "unknown",
+        background,
+    )
     contents = await file.read()
     filename = file.filename or "unknown"
     content_type = file.content_type or "application/octet-stream"
@@ -175,6 +198,7 @@ async def ingest_file(
                     data={
                         "tenant_id": user.tenant_id,
                         "namespace": namespace,
+                        "user_id": user.user_id,
                         "document_id": document_id,
                         "source_path": tmp_permanent,
                         "title": title or filename,
@@ -359,6 +383,7 @@ async def delete_document(
                     data={
                         "tenant_id": user.tenant_id,
                         "namespace": namespace,
+                        "user_id": user.user_id,
                         "doc_hash": doc_hash,
                         "job_id": job_id,
                     },

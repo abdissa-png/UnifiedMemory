@@ -28,30 +28,6 @@ def _require_session_manager(ctx):
         raise HTTPException(501, "Chat sessions not configured (SQL not enabled)")
     return sm
 
-
-@router.post("/sessions/{namespace}", response_model=SessionResponse)
-async def create_session(
-    namespace: str,
-    body: CreateSessionRequest,
-    ns_config=Depends(ACLChecker(Permission.READ)),
-    user: AuthenticatedUser = Depends(get_current_user),
-    ctx=Depends(get_system_context),
-):
-    sm = _require_session_manager(ctx)
-    session = await sm.create_session(
-        tenant_id=user.tenant_id,
-        user_id=user.user_id,
-        namespace=namespace,
-        title=body.title,
-    )
-    return SessionResponse(
-        id=session.id,
-        namespace=session.namespace,
-        title=session.title,
-        created_at=str(session.created_at),
-    )
-
-
 @router.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(
     namespace: str,
@@ -90,7 +66,11 @@ async def send_message(
     if session.user_id != user.user_id:
         raise HTTPException(403, "Not your session")
 
-    set_request_context(tenant_id=user.tenant_id, namespace=session.namespace)
+    set_request_context(
+        tenant_id=user.tenant_id,
+        namespace=session.namespace,
+        user_id=user.user_id,
+    )
 
     # Store user message
     await sm.add_message(session_id, "user", body.content)
@@ -186,3 +166,26 @@ async def associate_document(
 
     await sm.associate_document(session_id, body.document_id)
     return {"status": "associated"}
+
+
+@router.post("/sessions/{namespace:path}", response_model=SessionResponse)
+async def create_session(
+    namespace: str,
+    body: CreateSessionRequest,
+    ns_config=Depends(ACLChecker(Permission.READ)),
+    user: AuthenticatedUser = Depends(get_current_user),
+    ctx=Depends(get_system_context),
+):
+    sm = _require_session_manager(ctx)
+    session = await sm.create_session(
+        tenant_id=user.tenant_id,
+        user_id=user.user_id,
+        namespace=namespace,
+        title=body.title,
+    )
+    return SessionResponse(
+        id=session.id,
+        namespace=session.namespace,
+        title=session.title,
+        created_at=str(session.created_at),
+    )
