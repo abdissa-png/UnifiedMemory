@@ -4,6 +4,8 @@ Admin and GDPR endpoints.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from unified_memory.api.deps import get_current_user, get_system_context
@@ -39,6 +41,9 @@ def _cfg_to_response(cfg) -> TenantConfigResponse:
             model=cfg.vision_embedding.model,
             dimension=cfg.vision_embedding.dimension,
         )
+    extraction_cfg = cfg.extraction
+    if extraction_cfg is not None and not isinstance(extraction_cfg, dict):
+        extraction_cfg = asdict(extraction_cfg)
     return TenantConfigResponse(
         tenant_id=cfg.tenant_id,
         text_embedding=text_emb,
@@ -53,6 +58,7 @@ def _cfg_to_response(cfg) -> TenantConfigResponse:
         batch_size=cfg.batch_size,
         deduplication_enabled=cfg.deduplication_enabled,
         llm=cfg.llm,
+        extraction=extraction_cfg,
         created_at=cfg.created_at,
         updated_at=cfg.updated_at,
     )
@@ -120,7 +126,33 @@ async def update_tenant_config(
     if body.llm_provider and body.llm_model:
         cfg.llm = {"provider": body.llm_provider, "model": body.llm_model}
 
-    from dataclasses import asdict
+    extraction_updates = {}
+    if body.extraction_extractor_type is not None:
+        extraction_updates["extractor_type"] = body.extraction_extractor_type
+    if body.extraction_llm_model is not None:
+        extraction_updates["llm_model"] = body.extraction_llm_model
+    if body.extraction_entity_types is not None:
+        extraction_updates["entity_types"] = body.extraction_entity_types
+    if body.extraction_relation_types is not None:
+        extraction_updates["relation_types"] = body.extraction_relation_types
+    if body.extraction_confidence_threshold is not None:
+        extraction_updates["confidence_threshold"] = body.extraction_confidence_threshold
+    if body.extraction_batch_size is not None:
+        extraction_updates["batch_size"] = body.extraction_batch_size
+    if body.extraction_strict_type_filtering is not None:
+        extraction_updates["strict_type_filtering"] = body.extraction_strict_type_filtering
+    if extraction_updates:
+        from unified_memory.namespace.types import ExtractionConfig
+
+        current = cfg.extraction
+        if isinstance(current, dict):
+            current = ExtractionConfig(**current)
+        if current is None:
+            current = ExtractionConfig()
+        for key, value in extraction_updates.items():
+            setattr(current, key, value)
+        cfg.extraction = current
+
     from unified_memory.core.types import utc_now
 
     cfg.updated_at = utc_now().isoformat()

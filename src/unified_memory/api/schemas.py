@@ -27,8 +27,23 @@ class RegisterTenantRequest(BaseModel):
     vision_embedding_model: Optional[str] = None
     vision_embedding_dimension: Optional[int] = None
     chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
     chunker_type: Optional[str] = None
     enable_graph_storage: Optional[bool] = None
+    enable_visual_indexing: Optional[bool] = None
+    enable_entity_extraction: Optional[bool] = None
+    enable_relation_extraction: Optional[bool] = None
+    batch_size: Optional[int] = None
+    deduplication_enabled: Optional[bool] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    extraction_extractor_type: Optional[str] = None
+    extraction_llm_model: Optional[str] = None
+    extraction_entity_types: Optional[List[str]] = None
+    extraction_relation_types: Optional[List[str]] = None
+    extraction_confidence_threshold: Optional[float] = None
+    extraction_batch_size: Optional[int] = None
+    extraction_strict_type_filtering: Optional[bool] = None
 
 class RegisterTenantResponse(BaseModel):
     tenant_id: str
@@ -230,6 +245,7 @@ class TenantConfigResponse(BaseModel):
     batch_size: int = 100
     deduplication_enabled: bool = True
     llm: Optional[Dict[str, Any]] = None
+    extraction: Optional[Dict[str, Any]] = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -252,3 +268,10 @@ class UpdateTenantConfigRequest(BaseModel):
     vision_embedding_dimension: Optional[int] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    extraction_extractor_type: Optional[str] = None
+    extraction_llm_model: Optional[str] = None
+    extraction_entity_types: Optional[List[str]] = None
+    extraction_relation_types: Optional[List[str]] = None
+    extraction_confidence_threshold: Optional[float] = None
+    extraction_batch_size: Optional[int] = None
+    extraction_strict_type_filtering: Optional[bool] = None
