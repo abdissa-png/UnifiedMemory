@@ -19,6 +19,32 @@ from fastapi.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 
+def _configure_application_logging() -> None:
+    """Ensure app/module loggers emit through uvicorn or stdout."""
+    level_name = os.environ.get("UMS_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+        return
+
+    # uvicorn config usually installs handlers on uvicorn.error only.
+    if root_logger.level > level:
+        root_logger.setLevel(level)
+
+    uvicorn_error_logger = logging.getLogger("uvicorn.error")
+    if uvicorn_error_logger.handlers:
+        app_logger = logging.getLogger("unified_memory")
+        if not app_logger.handlers:
+            app_logger.handlers = list(uvicorn_error_logger.handlers)
+        app_logger.setLevel(level)
+        app_logger.propagate = False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialise SystemContext and wire everything at startup."""
@@ -26,7 +52,7 @@ async def lifespan(app: FastAPI):
     from unified_memory.storage.sql.engine import create_sql_engine, create_session_factory, init_db
     from unified_memory.storage.sql.session_manager import ChatSessionManager
     from unified_memory.observability.audit import AuditLogger
-    from unified_memory.observability.tracing import set_flush_callback
+    from unified_memory.observability.tracing import set_flush_callback, user_id_for_token_usage
     from unified_memory.namespace.tenant_manager import TenantManager
 
     config_path = os.environ.get("UMS_CONFIG", "config/app.example.yaml")
@@ -34,26 +60,38 @@ async def lifespan(app: FastAPI):
     token_expire_minutes = int(os.environ.get("UMS_TOKEN_EXPIRE_MINUTES", "60"))
     db_url = os.environ.get("UMS_DATABASE_URL","postgresql+asyncpg://postgres:postgres@localhost:5432/unified_memory_test")
     enable_inngest = os.environ.get("UMS_ENABLE_INNGEST", "").lower() in ("1", "true")
+    skip_db_init = os.environ.get("UMS_SKIP_DB_INIT", "").lower() in ("1", "true")
     allow_create_all_fallback = os.environ.get(
         "UMS_SQL_CREATE_ALL_FALLBACK", ""
     ).lower() in ("1", "true")
+
+    logger.info("startup.step begin config_path=%s", config_path)
 
     # Build system context
     if os.path.exists(config_path):
         ctx = SystemContext.from_config_file(config_path)
     else:
         ctx = SystemContext()
+    logger.info("startup.step system_context_built")
 
     ctx.build_services(enable_inngest=enable_inngest)
+    logger.info("startup.step services_built enable_inngest=%s", enable_inngest)
 
     # SQL engine
     sql_engine = create_sql_engine(db_url)
     sf = create_session_factory(sql_engine)
-    await init_db(
-        sql_engine,
-        db_url,
-        allow_create_all_fallback=allow_create_all_fallback,
-    )
+    logger.info("startup.step sql_engine_ready")
+    if skip_db_init:
+        logger.warning("startup.step init_db_skipped UMS_SKIP_DB_INIT=true")
+    else:
+        await init_db(
+            sql_engine,
+            db_url,
+            allow_create_all_fallback=allow_create_all_fallback,
+        )
+        logger.info("startup.step init_db_complete")
+        # Alembic's fileConfig can alter logging; re-apply app handler wiring.
+        _configure_application_logging()
 
     ctx.sql_session_factory = sf
     ctx.chat_session_manager = ChatSessionManager(sf)
@@ -62,7 +100,7 @@ async def lifespan(app: FastAPI):
     if ctx.qa_agent is not None:
         ctx.qa_agent.session_manager = ctx.chat_session_manager
     ctx.audit_logger = AuditLogger(sf)
-    ctx.tenant_manager = TenantManager(ctx.kv_store)
+    ctx.tenant_manager = TenantManager(ctx.kv_store,ctx.vector_store)
 
     # Wire usage flush callback
     async def _flush_usage(trace_ctx):
@@ -76,6 +114,7 @@ async def lifespan(app: FastAPI):
                         id=_uuid.uuid4().hex,
                         trace_id=trace_ctx.trace_id,
                         tenant_id=trace_ctx.tenant_id,
+                        user_id=user_id_for_token_usage(trace_ctx),
                         namespace=trace_ctx.namespace,
                         service=r.service,
                         model=r.model,
@@ -92,11 +131,24 @@ async def lifespan(app: FastAPI):
             await db.commit()
 
     set_flush_callback(_flush_usage)
+    logger.info("startup.step flush_callback_registered")
 
     # Store on app state
     app.state.system_context = ctx
     app.state.jwt_secret = jwt_secret
     app.state.token_expire_minutes = token_expire_minutes
+
+    # Register Inngest serve handler (if available/enabled).
+    if ctx.inngest_client and ctx.inngest_functions:
+        try:
+            import inngest.fast_api
+
+            inngest.fast_api.serve(
+                app, ctx.inngest_client, ctx.inngest_functions
+            )
+            logger.info("Inngest functions registered")
+        except ImportError:
+            logger.warning("inngest.fast_api not available; skipping")
 
     logger.info("Unified Memory System started")
 
@@ -110,6 +162,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     """Build and return the FastAPI application."""
+    _configure_application_logging()
     app = FastAPI(
         title="Unified Memory System",
         version="0.1.0",
@@ -128,6 +181,13 @@ def create_app() -> FastAPI:
 
     app.add_middleware(RequestContextMiddleware)
 
+    try:
+        from prometheus_client import make_asgi_app
+
+        app.mount("/metrics", make_asgi_app())
+    except ImportError:
+        pass
+
     # Routes
     from unified_memory.api.routes import auth, namespaces, ingestion, search, chat, admin
 
@@ -137,21 +197,6 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(chat.router)
     app.include_router(admin.router)
-
-    # Inngest serve handler (if available)
-    @app.on_event("startup")
-    async def _register_inngest():
-        ctx = app.state.system_context
-        if ctx.inngest_client and ctx.inngest_functions:
-            try:
-                import inngest.fast_api
-
-                inngest.fast_api.serve(
-                    app, ctx.inngest_client, ctx.inngest_functions
-                )
-                logger.info("Inngest functions registered")
-            except ImportError:
-                logger.warning("inngest.fast_api not available; skipping")
 
     @app.get("/health/live")
     async def health_live():
