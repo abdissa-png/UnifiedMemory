@@ -47,15 +47,17 @@ pdf = [
   "pymupdf>=1.24.0",
 ]
 mineru = [
-  "mineru[pipeline]",
+  "mineru[pipeline]==2.7.6",
   "Pillow>=10.0.0",
   "numpy==2.0.1",
+  "scipy==1.17.1",
+  "scikit-learn==1.8.0"
 ]
 workflows = [
   "inngest>=0.5.0",
 ]
 all = [
-  "unified-memory-system[databases,openai,rerankers,pdf,dev]",
+  "unified-memory-system[databases,openai,mineru,rerankers,pdf,dev]",
 ]
 server = [
   "unified-memory-system[all,workflows]",
@@ -67,7 +69,8 @@ server = [
   "asyncpg>=0.29.0",
   "pyyaml>=6.0",
   "python-jose[cryptography]>=3.3.0",
-  "passlib[bcrypt]>=1.7.4",
+  "passlib==1.7.4",
+  "bcrypt==3.2.2",
   "python-multipart>=0.0.5",
   "structlog>=23.0.0",
   "prometheus-client==0.24.1"
