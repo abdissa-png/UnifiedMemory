@@ -28,6 +28,11 @@ infra:
   elasticsearch_api_key: "${ELASTICSEARCH_API_KEY}"
 
 embedding_providers:
+  # If tenant registration omits explicit embedding settings, the backend
+  # currently assumes these default model pairs exist:
+  # - text:   openai + text-embedding-3-small
+  # - vision: openai + clip-vit-base-patch32
+  # Streamlit registration now lets you override them explicitly.
   # Mock provider used in tests and local dev; key is an arbitrary ID.
   "mock:mock-model":
     provider: "mock"
@@ -36,32 +41,44 @@ embedding_providers:
     modality: "text"
 
   # Example OpenAI text embedding provider.
-  "openai:text-embedding-3-small":
-    provider: "openai"
-    model: "text-embedding-3-small"
-    dimension: 1536
-    api_key: "${OPENAI_API_KEY}"
-    base_url: "${OPENAI_BASE_URL}"
-    modality: "text"
+  # "openai:text-embedding-3-small":
+  #   provider: "openai"
+  #   model: "text-embedding-3-small"
+  #   dimension: 1536
+  #   api_key: "${OPENAI_API_KEY}"
+  #   base_url: "${OPENAI_BASE_URL}"
+  #   modality: "text"
 
-  # Example OpenAI vision/multimodal embedding provider.
-  "openai:clip-vit-base-patch32":
+  # # Example OpenAI vision/multimodal embedding provider.
+  # "openai:clip-vit-base-patch32":
+  #   provider: "openai"
+  #   model: "clip-vit-base-patch32"
+  #   dimension: 512
+  #   api_key: "${OPENAI_API_KEY}"
+  #   base_url: "${OPENAI_BASE_URL}"
+  #   modality: "vision"
+
+  "openai:embeddinggemma-300m":
     provider: "openai"
-    model: "clip-vit-base-patch32"
-    dimension: 512
-    api_key: "${OPENAI_API_KEY}"
-    base_url: "${OPENAI_BASE_URL}"
-    modality: "vision"
+    model: "embeddinggemma-300m"
+    dimension: 768
+    base_url: "${LAMHIEU_BASE_URL}"
+    modality: "shared"
 
 llm_providers:
   # Example OpenAI chat model for extraction and QA.
-  "openai:gpt-4o-mini":
+  # "openai:gpt-4o-mini":
+  #   provider: "openai"
+  #   model: "gpt-4o-mini"
+  #   api_key: "${OPENAI_API_KEY}"
+  #   base_url: "${OPENAI_BASE_URL}"
+  #   supports_images: true
+  "openai:meta-llama/Llama-3.3-70B-Instruct":
     provider: "openai"
-    model: "gpt-4o-mini"
-    api_key: "${OPENAI_API_KEY}"
-    base_url: "${OPENAI_BASE_URL}"
-    supports_images: true
-
+    model: "meta-llama/Llama-3.3-70B-Instruct"
+    api_key: "${HYPERBOLIC_API_KEY}"
+    base_url: ${HYPERBOLIC_BASE_URL}
+    supports_images: false
 extractors:
   # Default mock extractor (no external calls).
   "mock":
@@ -70,7 +87,7 @@ extractors:
   # LLM-based extractor using the above LLM provider.
   "llm-default":
     type: "llm"
-    llm_provider: "openai:gpt-4o-mini"
+    llm_provider: "openai:meta-llama/Llama-3.3-70B-Instruct"
 
 rerankers:
   # Local BGE reranker via sentence-transformers.
