@@ -1,0 +1,160 @@
+# Full local stack: infra + UMS API + Inngest dev + Streamlit + Prometheus.
+#
+# Usage:
+#   cp .env.example .env   # then edit URLs for Docker hostnames where needed
+#   docker compose -f docker-compose.stack.yml up --build
+#
+# URLs:
+#   API http://localhost:8000/metrics   Streamlit http://localhost:8501
+#   Inngest dev UI http://localhost:8288   Prometheus http://localhost:9090
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: unified_memory_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d unified_memory_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && head -1 <&3 | grep -q \"200\"' || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  neo4j:
+    image: neo4j:5.15.0-community
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  ums-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: unified-memory-backend:local
+    container_name: ums-backend
+    ports:
+      - "8000:8000"
+
+    runtime: nvidia
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+
+  # Official Inngest dev server (CLI inside image). SDK in ums-backend talks to this on 8288.
+  inngest-dev:
+    image: inngest/inngest:v1.17.2
+    ports:
+      - "8288:8288"
+      - "8289:8289"
+    command:
+      - "inngest"
+      - "dev"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8288"
+      - "-u"
+      - "http://ums-backend:8000/api/inngest"
+    depends_on:
+      ums-backend:
+        condition: service_started
+
+  streamlit-demo:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.streamlit
+    image: unified-memory-streamlit:local
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      UMS_API_BASE_URL: http://ums-backend:8000
+      UMS_CONFIG: ${UMS_CONFIG:-/app/config/app.example.yaml}
+    depends_on:
+      ums-backend:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    depends_on:
+      - ums-backend
