@@ -34,9 +34,10 @@ if not namespace:
 # Session management
 col_new, col_list = st.columns([1, 2])
 with col_new:
+    new_session_title = st.text_input("New session title", key="new_session_title")
     if st.button("New Session"):
         try:
-            session = client.create_session(namespace)
+            session = client.create_session(namespace, title=new_session_title)
             st.session_state["chat_session_id"] = session["id"]
             st.rerun()
         except Exception as e:
@@ -60,6 +61,27 @@ session_id = st.session_state.get("chat_session_id")
 if not session_id:
     st.info("Create or select a chat session.")
     st.stop()
+
+with st.expander("Associate Document"):
+    try:
+        docs = client.list_documents(namespace)
+    except Exception:
+        docs = []
+    doc_options = {
+        doc["document_id"]: doc.get("original_filename") or doc["document_id"]
+        for doc in docs
+    }
+    selected_doc_id = st.selectbox(
+        "Document",
+        [""] + list(doc_options.keys()),
+        format_func=lambda doc_id: doc_options.get(doc_id, "Select a document") if doc_id else "Select a document",
+    )
+    if st.button("Associate Document", disabled=not selected_doc_id):
+        try:
+            result = client.associate_document(session_id, selected_doc_id)
+            st.success(result.get("status", "associated"))
+        except Exception as e:
+            st.error(str(e))
 
 # Display messages
 try:
